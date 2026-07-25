@@ -31,6 +31,19 @@ def test_gateway_watcher_remains_hash_only():
     assert "_notify_subscribers(sessions)" in poll_once
 
 
+def test_gateway_sse_initial_snapshot_uses_watcher_cache():
+    """Connecting an SSE client must not launch another state.db projection."""
+    src = _read(ROOT / "api" / "routes.py")
+    handler = _block(
+        src,
+        "def _handle_gateway_sse_stream(handler, parsed):",
+        "\n\ndef _handle_session_events_stream",
+    )
+
+    assert 'initial = watcher.snapshot()' in handler
+    assert 'if hasattr(watcher, "snapshot")' in handler
+
+
 def test_gateway_sse_dedupes_reconnect_snapshot_before_refresh():
     """Reconnect initial snapshots should not force a sidebar refetch."""
     src = _read(SESSIONS_JS)

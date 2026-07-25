@@ -1,11 +1,36 @@
 """Shared helpers for reading Hermes Agent sessions from state.db."""
 import logging
+import os
 import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_ROLLBACK_JOURNAL_MODES = {"delete", "truncate", "persist"}
+_ROLLBACK_READ_DEADLINE_SECONDS = 2.0
+
+
+def _managed_state_db_read_deadline(
+    explicit_deadline_seconds: float | None,
+) -> float | None:
+    """Return the safety deadline for a live agent-state read.
+
+    The WebUI shares ``state.db`` with the gateway. In rollback-journal mode,
+    every reader blocks the writer's commit, so no WebUI request may retain a
+    SHARED lock indefinitely—even an interactive sidebar/import request.
+    Managed deployments declare the journal mode without opening SQLite.
+    """
+    if explicit_deadline_seconds is not None:
+        return explicit_deadline_seconds
+    journal_mode = os.getenv(
+        "HERMES_WEBUI_STATE_DB_JOURNAL_MODE",
+        "",
+    ).strip().lower()
+    if journal_mode in _ROLLBACK_JOURNAL_MODES:
+        return _ROLLBACK_READ_DEADLINE_SECONDS
+    return None
 
 
 def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> sqlite3.Connection:
@@ -30,14 +55,19 @@ def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> 
         raise FileNotFoundError(f"agent state.db not found: {db_path}")
     read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
     try:
-        return sqlite3.connect(read_only_uri, uri=True)
+        conn = sqlite3.connect(read_only_uri, uri=True)
     except sqlite3.Error as exc:
         log.warning(
             "agent state.db read-only open failed for %s; falling back to writable connection: %s",
             db_path,
             exc,
         )
-        return sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(str(db_path))
+    configure_state_db_read_deadline(
+        conn,
+        _managed_state_db_read_deadline(None),
+    )
+    return conn
 
 
 def configure_state_db_read_deadline(
@@ -54,9 +84,10 @@ def configure_state_db_read_deadline(
     filesystem syscall can overshoot that target, which is why rollback-mode
     callers also wait for a database quiet window before opening a reader.
 
-    ``None`` preserves the historical unbounded behavior for interactive reads.
-    The gateway watcher supplies a short deadline because its result is
-    best-effort and it polls again automatically.
+    ``None`` preserves the historical unbounded behavior outside a managed
+    rollback-journal deployment. Rollback mode applies a two-second safety
+    default to every WebUI read; the gateway watcher supplies a shorter explicit
+    deadline because its result is best-effort and it polls again automatically.
     """
     if deadline_seconds is None:
         return
@@ -572,7 +603,10 @@ def read_importable_agent_session_rows(
         conn = sqlite3.connect(str(db_path))
     with closing(conn):
         conn.row_factory = sqlite3.Row
-        configure_state_db_read_deadline(conn, query_deadline_seconds)
+        configure_state_db_read_deadline(
+            conn,
+            _managed_state_db_read_deadline(query_deadline_seconds),
+        )
         cur = conn.cursor()
 
         # Older Hermes Agent versions may not have source tracking. Without a

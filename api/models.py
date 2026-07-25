@@ -4806,7 +4806,7 @@ def state_db_has_session(sid: str) -> bool:
     if not sid:
         return False
     try:
-        import sqlite3
+        import sqlite3  # noqa: F401 - preserve the optional-dependency guard
     except ImportError:
         return False
     db_path = _active_state_db_path()
@@ -4912,7 +4912,7 @@ def agent_session_rows_existing(
     if not wanted:
         return frozenset()
     try:
-        import sqlite3
+        import sqlite3  # noqa: F401 - preserve the optional-dependency guard
     except ImportError:
         return frozenset(wanted)
     db_path = _agent_state_db_path(profile=profile)
@@ -4968,7 +4968,7 @@ def agent_session_zero_message_sids(
     if not wanted:
         return frozenset()
     try:
-        import sqlite3
+        import sqlite3  # noqa: F401 - preserve the optional-dependency guard
     except ImportError:
         return frozenset()
     db_path = _agent_state_db_path(profile=profile)
@@ -6376,16 +6376,13 @@ def _sqlite_content_fingerprint(db_path: Path):
     except OSError:
         return None
     try:
-        import sqlite3
         # Read-only + a tiny busy timeout: a fingerprint read must NEVER stall the
         # /api/sessions hot path when state.db is briefly locked by a writer.
         # On lock (or any error) we return None and the caller falls back to the
         # cheap file-stat stamp, so correctness degrades gracefully to the prior
         # behavior rather than blocking for the default multi-second busy timeout.
         try:
-            conn = sqlite3.connect(
-                f"file:{db_path}?mode=ro", uri=True, timeout=0.05
-            )
+            conn = open_state_db_readonly(Path(db_path), log=logger)
         except Exception:
             return None
         try:

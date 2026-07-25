@@ -17,8 +17,11 @@ import threading
 import shutil
 import sqlite3
 from collections import Counter
+from contextlib import closing
 from pathlib import Path
 from typing import Iterable
+
+from api.agent_sessions import open_state_db_readonly
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -102,7 +105,7 @@ def _read_state_db(state_db_path: Path | None) -> dict[str, dict]:
     if state_db_path is None or not state_db_path.exists():
         return {}
     try:
-        with sqlite3.connect(f"file:{state_db_path}?mode=ro", uri=True) as conn:
+        with closing(open_state_db_readonly(state_db_path)) as conn:
             conn.row_factory = sqlite3.Row
             tables = {row[0] for row in conn.execute("select name from sqlite_master where type='table'")}
             if "sessions" not in tables:
