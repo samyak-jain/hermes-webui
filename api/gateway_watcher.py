@@ -9,18 +9,20 @@ This enables real-time session list updates in the sidebar without
 requiring any changes to hermes-agent.
 """
 import hashlib
-import json
 import logging
 import os
 import queue
-import sqlite3
 import threading
 import time
 from contextlib import closing
 from pathlib import Path
 
 from api.config import HOME
-from api.agent_sessions import open_state_db_readonly, read_importable_agent_session_rows
+from api.agent_sessions import (
+    configure_state_db_read_deadline,
+    open_state_db_readonly,
+    read_importable_agent_session_rows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +43,49 @@ def _snapshot_hash(sessions: list) -> str:
 # cheap change-detection scan below sees exactly the same row set as the
 # expensive projection (otherwise cron message churn would defeat the gate).
 _WATCHER_EXCLUDED_SOURCES = ("cron", "webui")
+_WATCHER_DB_READ_DEADLINE_SECONDS = 0.25
+_WATCHER_SLOW_POLL_SECONDS = 0.20
+_WATCHER_WARNING_INTERVAL_SECONDS = 60.0
+_WATCHER_DEGRADED_AFTER_ERRORS = 3
+_ROLLBACK_QUIET_SECONDS = 15.0
+_ROLLBACK_ERROR_BACKOFF_SECONDS = 60.0
+_ROLLBACK_JOURNAL_MODES = {"delete", "truncate", "persist"}
+
+
+def _state_db_stat_fingerprint(db_path: Path) -> tuple[int, int] | None:
+    """Return a lock-free change signal for rollback-journal observation."""
+    try:
+        stat = db_path.stat()
+        return stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return None
+
+
+def _detect_journal_mode(db_path: Path) -> str:
+    """Resolve the live journal mode once, preferring an operator override."""
+    configured = os.getenv("HERMES_WEBUI_STATE_DB_JOURNAL_MODE", "").strip().lower()
+    if configured in {"wal", *_ROLLBACK_JOURNAL_MODES}:
+        return configured
+    if Path(f"{db_path}-wal").exists():
+        return "wal"
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            configure_state_db_read_deadline(
+                conn,
+                _WATCHER_DB_READ_DEADLINE_SECONDS,
+            )
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            mode = str(row[0] if row else "").strip().lower()
+            if mode in {"wal", *_ROLLBACK_JOURNAL_MODES}:
+                return mode
+    except Exception:
+        logger.debug("Gateway watcher could not detect state.db journal mode")
+    # Unknown/exotic filesystems get the conservative reader/writer policy.
+    return "unknown"
 
 
 def _cheap_change_fingerprint(db_path: Path) -> str | None:
-    """Compute a cheap change-detection fingerprint without the messages JOIN.
+    """Compute an indexed change fingerprint without aggregating ``messages``.
 
     The expensive projection (``read_importable_agent_session_rows``) runs a CTE
     plus a per-session ``MAX(messages.timestamp)`` aggregation over an oversampled
@@ -63,19 +104,16 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
     to one of those alters *which rows* appear even when no displayed field on a
     given row moved.
 
-    The one projection input that does not live in the ``sessions`` table is the
-    per-session message aggregate (``COUNT`` / ``MAX(messages.timestamp)`` ->
-    ``last_activity``). That is fully proxied by ``sessions.message_count``: the
-    agent's state layer bumps ``message_count`` on every appended message and
-    rewrites it to the absolute count on truncate/rewind/compaction, so a message
-    insert or delete (the only events that can move ``MAX(timestamp)``) always
-    changes ``message_count``. The fingerprint is therefore a strict superset of
-    the projection's change surface (it also fires on out-of-order inserts that
-    would not raise ``MAX(timestamp)``).
+    Same-count transcript rewrites can move ``last_activity`` without changing a
+    ``sessions`` column.  Detect those with one indexed latest-timestamp lookup
+    per visible session.  The previous implementation used ``LEFT JOIN`` +
+    ``COUNT/MAX`` + ``GROUP BY`` across the entire messages table every five
+    seconds.  On a network filesystem in rollback-journal mode that query held a
+    SHARED lock for minutes and starved every gateway writer.
 
     Returns the fingerprint string, or ``None`` on any error / a pre-source
-    schema so the caller falls back to running the expensive projection rather
-    than risk skipping a change.
+    schema. The watcher retains its last known snapshot and retries later when
+    it cannot prove what changed.
     """
     # Columns the projection reads from the ``sessions`` table. ``id``/``source``
     # are always present (``source`` is required for the projection to run at
@@ -88,6 +126,10 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
     )
     try:
         with closing(open_state_db_readonly(db_path)) as conn:
+            configure_state_db_read_deadline(
+                conn,
+                _WATCHER_DB_READ_DEADLINE_SECONDS,
+            )
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
             cols = {row[1] for row in cur.fetchall()}
@@ -95,51 +137,48 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
                 return None
             selectable = [c for c in _PROJECTION_SESSION_COLS if c in cols]
             placeholders = ", ".join("?" for _ in _WATCHER_EXCLUDED_SOURCES)
+            latest_message_expr = "NULL"
+            cur.execute("PRAGMA table_info(messages)")
+            message_cols = {row[1] for row in cur.fetchall()}
+            if {'session_id', 'timestamp'}.issubset(message_cols):
+                cur.execute("PRAGMA index_list(messages)")
+                message_indexes = {str(row[1]) for row in cur.fetchall()}
+                if "idx_messages_session" not in message_indexes:
+                    # Preserve compatibility with old/minimal agent schemas.
+                    # message_count still detects normal appends. Same-count
+                    # transcript rewrites require the current agent's covering
+                    # index, but this background reader must never create that
+                    # index or replace it with a full-table aggregate.
+                    logger.debug(
+                        "Gateway watcher using sessions-only fingerprint: "
+                        "idx_messages_session is unavailable"
+                    )
+                else:
+                    # ``idx_messages_session(session_id, timestamp)`` makes this
+                    # an O(log N) covering-index seek per session. INDEXED BY is
+                    # intentional so a future planner change cannot reintroduce
+                    # a full messages scan.
+                    latest_message_expr = (
+                        "(SELECT m.timestamp FROM messages m "
+                        "INDEXED BY idx_messages_session "
+                        "WHERE m.session_id = s.id "
+                        "ORDER BY m.timestamp DESC LIMIT 1)"
+                    )
             cur.execute(
-                f"SELECT {', '.join(selectable)} FROM sessions "
-                f"WHERE source IS NOT NULL AND source NOT IN ({placeholders}) "
-                f"ORDER BY id",
+                f"SELECT {', '.join(f's.{c}' for c in selectable)}, "
+                f"{latest_message_expr} AS latest_message_at "
+                f"FROM sessions s "
+                f"WHERE s.source IS NOT NULL AND s.source NOT IN ({placeholders}) "
+                f"ORDER BY s.id",
                 list(_WATCHER_EXCLUDED_SOURCES),
             )
             h = hashlib.md5(usedforsecurity=False)
             for row in cur.fetchall():
                 h.update(repr(row).encode('utf-8', 'replace'))
                 h.update(b'\x1e')
-            # A same-count transcript rewrite (SessionDB.replace_messages used by
-            # /retry, /undo, /compress) deletes + reinserts messages with new
-            # timestamps but can leave sessions.message_count unchanged — so the
-            # sessions-only scan above would miss it and the watcher would skip a
-            # projection whose last_activity (MAX(messages.timestamp)) actually
-            # moved. Fold in a PER-SESSION message aggregate, scoped to the same
-            # non-excluded sessions as the projection. It must be per-session
-            # (grouped), NOT a single global MAX: rewriting an OLDER, non-newest
-            # session moves that session's last_activity but not the global max,
-            # so a global aggregate would still miss it (#3536 review round 2).
-            # cron/webui churn is excluded by the JOIN filter so it still does
-            # NOT trigger a re-projection. This is one GROUP BY over the already-
-            # filtered set — far cheaper than the projection's oversampled
-            # correlated CTE — so it preserves the cheap-fingerprint property.
-            if 'messages' in {r[0] for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}:
-                try:
-                    msg_rows = conn.execute(
-                        "SELECT s.id, COUNT(m.id), "
-                        "COUNT(CASE WHEN LOWER(m.role) = 'user' THEN 1 END), "
-                        "COALESCE(MAX(m.timestamp), 0) "
-                        "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
-                        f"WHERE s.source IS NOT NULL AND s.source NOT IN ({placeholders}) "
-                        "GROUP BY s.id ORDER BY s.id",
-                        list(_WATCHER_EXCLUDED_SOURCES),
-                    ).fetchall()
-                    for mrow in msg_rows:
-                        h.update(repr(mrow).encode('utf-8', 'replace'))
-                        h.update(b'\x1e')
-                except sqlite3.Error:
-                    # messages table shape unknown → don't trust the fingerprint;
-                    # signal the caller to run the full projection.
-                    return None
             return h.hexdigest()
-    except Exception:
+    except Exception as exc:
+        logger.debug("Gateway watcher fingerprint unavailable: %s", exc)
         return None
 
 
@@ -157,9 +196,15 @@ def _get_state_db_path(hermes_home: Path | None = None) -> Path:
     return hermes_home / 'state.db'
 
 
-def _get_agent_sessions_from_db(db_path: Path | None = None) -> list:
+def _get_agent_sessions_from_db(
+    db_path: Path | None = None,
+    *,
+    read_deadline_seconds: float | None = None,
+) -> list | None:
     """Read all non-webui sessions from state.db.
-    Returns list of session dicts, or empty list on any error.
+
+    Returns a list of session dicts, ``[]`` when the database does not exist,
+    or ``None`` when an attempted read fails.
     """
     db_path = Path(db_path) if db_path is not None else _get_state_db_path()
     if not db_path.exists():
@@ -167,7 +212,12 @@ def _get_agent_sessions_from_db(db_path: Path | None = None) -> list:
 
     try:
         sessions = []
-        for row in read_importable_agent_session_rows(db_path, limit=200, log=logger):
+        for row in read_importable_agent_session_rows(
+            db_path,
+            limit=200,
+            log=logger,
+            query_deadline_seconds=read_deadline_seconds,
+        ):
             sessions.append({
                 'session_id': row['id'],
                 'title': row['title'] or 'Agent Session',
@@ -181,8 +231,9 @@ def _get_agent_sessions_from_db(db_path: Path | None = None) -> list:
                 'source_label': row.get('source_label'),
             })
         return sessions
-    except Exception:
-        return []
+    except Exception as exc:
+        logger.debug("Gateway watcher session projection unavailable: %s", exc)
+        return None
 
 
 # ── GatewayWatcher ──────────────────────────────────────────────────────────
@@ -208,6 +259,7 @@ class GatewayWatcher:
         hermes_home: Path | None = None,
         profile_name: str | None = None,
         state_db_path: Path | None = None,
+        journal_mode: str | None = None,
     ):
         self._subscribers: list[queue.Queue] = []
         self._sub_lock = threading.Lock()
@@ -220,10 +272,25 @@ class GatewayWatcher:
             else _get_state_db_path(self._hermes_home) if self._hermes_home is not None else _get_state_db_path()
         )
         self.profile_name = profile_name or ""
+        self._journal_mode = (
+            str(journal_mode).strip().lower()
+            if journal_mode
+            else _detect_journal_mode(self._state_db_path)
+        )
+        self._rollback_safe_polling = self._journal_mode != "wal"
+        self._last_db_stat: tuple[int, int] | None = None
+        self._processed_db_stat: tuple[int, int] | None = None
+        self._last_db_change_at = time.monotonic()
+        self._next_db_read_at = 0.0
         self._last_hash: str = ''
         self._last_sessions: list = []
-        # Cheap sessions-only fingerprint from the previous poll. When it is
-        # unchanged we skip the expensive messages-JOIN projection entirely
+        self._last_poll_ms = 0.0
+        self._last_success_at = 0.0
+        self._last_error = ""
+        self._consecutive_errors = 0
+        self._last_warning_at = 0.0
+        # Indexed change fingerprint from the previous poll. When it is
+        # unchanged we skip the full session projection entirely
         # (issue #3506). Empty string forces the first poll to run the full read.
         self._last_cheap_fp: str = ''
 
@@ -317,34 +384,131 @@ class GatewayWatcher:
                 except Exception:
                     logger.debug("Failed to send sentinel to dead subscriber")
 
+    def diagnostics(self) -> dict:
+        with self._sub_lock:
+            subscriber_count = len(self._subscribers)
+        degraded = self._consecutive_errors >= _WATCHER_DEGRADED_AFTER_ERRORS
+        return {
+            # A single best-effort observation can collide with a legitimate
+            # writer. Only persistent failures should fail deep health.
+            "status": "degraded" if degraded else "ok",
+            "profile": self.profile_name or "default",
+            "journal_mode": self._journal_mode,
+            "rollback_safe_polling": self._rollback_safe_polling,
+            "alive": self.is_alive(),
+            "subscriber_count": subscriber_count,
+            "last_poll_ms": round(self._last_poll_ms, 1),
+            "last_success_at": self._last_success_at or None,
+            "consecutive_errors": self._consecutive_errors,
+            "last_error": self._last_error or None,
+        }
+
+    def _record_poll_error(self, message: str, elapsed: float) -> None:
+        self._last_poll_ms = elapsed * 1000
+        self._last_error = message
+        self._consecutive_errors += 1
+        now = time.monotonic()
+        if now - self._last_warning_at >= _WATCHER_WARNING_INTERVAL_SECONDS:
+            self._last_warning_at = now
+            logger.warning(
+                "Gateway watcher state.db poll degraded after %.1fms: %s",
+                self._last_poll_ms,
+                message,
+            )
+
+    def _record_poll_success(self, elapsed: float) -> None:
+        self._last_poll_ms = elapsed * 1000
+        self._last_success_at = time.time()
+        self._last_error = ""
+        self._consecutive_errors = 0
+        if elapsed >= _WATCHER_SLOW_POLL_SECONDS:
+            now = time.monotonic()
+            if now - self._last_warning_at >= _WATCHER_WARNING_INTERVAL_SECONDS:
+                self._last_warning_at = now
+                logger.warning(
+                    "Gateway watcher state.db poll took %.1fms",
+                    self._last_poll_ms,
+                )
+
+    def _poll_once(self) -> None:
+        started = time.monotonic()
+        db_path = self._state_db_path
+        rollback_stat = None
+        if self._rollback_safe_polling:
+            now = time.monotonic()
+            rollback_stat = _state_db_stat_fingerprint(db_path)
+            if rollback_stat != self._last_db_stat:
+                self._last_db_stat = rollback_stat
+                self._last_db_change_at = now
+                self._record_poll_success(time.monotonic() - started)
+                return
+            if rollback_stat == self._processed_db_stat:
+                self._record_poll_success(time.monotonic() - started)
+                return
+            if (
+                now < self._next_db_read_at
+                or now - self._last_db_change_at < _ROLLBACK_QUIET_SECONDS
+            ):
+                self._record_poll_success(time.monotonic() - started)
+                return
+
+        cheap_fp = _cheap_change_fingerprint(db_path) if db_path.exists() else ''
+        if cheap_fp is None:
+            if self._rollback_safe_polling:
+                self._next_db_read_at = (
+                    time.monotonic() + _ROLLBACK_ERROR_BACKOFF_SECONDS
+                )
+            self._record_poll_error(
+                "fingerprint read timed out or failed",
+                time.monotonic() - started,
+            )
+            return
+        if cheap_fp == self._last_cheap_fp:
+            if self._rollback_safe_polling:
+                # The file changed, but only outside the sidebar-visible
+                # projection (for example a cron session). Mark this exact
+                # committed image processed so rollback mode does not reopen
+                # SQLite every five seconds for the same non-change.
+                self._processed_db_stat = rollback_stat
+                self._next_db_read_at = 0.0
+            self._record_poll_success(time.monotonic() - started)
+            return
+
+        sessions = _get_agent_sessions_from_db(
+            db_path,
+            read_deadline_seconds=_WATCHER_DB_READ_DEADLINE_SECONDS,
+        )
+        if sessions is None:
+            if self._rollback_safe_polling:
+                self._next_db_read_at = (
+                    time.monotonic() + _ROLLBACK_ERROR_BACKOFF_SECONDS
+                )
+            self._record_poll_error(
+                "session projection read timed out or failed",
+                time.monotonic() - started,
+            )
+            return
+
+        current_hash = _snapshot_hash(sessions)
+        self._last_cheap_fp = cheap_fp
+        if self._rollback_safe_polling:
+            self._processed_db_stat = rollback_stat
+            self._next_db_read_at = 0.0
+        if current_hash != self._last_hash:
+            self._last_hash = current_hash
+            self._last_sessions = sessions
+            self._notify_subscribers(sessions)
+        self._record_poll_success(time.monotonic() - started)
+
     def _poll_loop(self):
         """Main polling loop. Runs in a daemon thread."""
         while not self._stop_event.is_set():
             try:
-                # Phase 1: cheap sessions-only fingerprint. The expensive
-                # messages-JOIN projection (_get_agent_sessions_from_db) only
-                # runs when this fingerprint actually changes, so an idle server
-                # with a large state.db stops re-aggregating tens of thousands
-                # of message rows every 5 seconds (issue #3506). A None
-                # fingerprint (error / unreadable db) forces the full read so we
-                # never silently skip a real change.
-                db_path = self._state_db_path
-                cheap_fp = _cheap_change_fingerprint(db_path) if db_path.exists() else ''
-                if cheap_fp is not None and cheap_fp == self._last_cheap_fp:
-                    # Nothing changed in the sidebar-visible session set; skip
-                    # the expensive projection and the notify entirely.
-                    pass
-                else:
-                    # Phase 2: only now pay for the full projection.
-                    sessions = _get_agent_sessions_from_db(db_path)
-                    current_hash = _snapshot_hash(sessions)
-                    if cheap_fp is not None:
-                        self._last_cheap_fp = cheap_fp
-
-                    if current_hash != self._last_hash:
-                        self._last_hash = current_hash
-                        self._last_sessions = sessions
-                        self._notify_subscribers(sessions)
+                # Rollback-journal databases first wait for a quiet file
+                # metadata window. WAL databases poll the indexed change
+                # fingerprint directly. The full session projection runs only
+                # after a real change (issue #3506).
+                self._poll_once()
             except Exception:
                 logger.debug("Error in gateway watcher poll loop", exc_info=True)
 
@@ -477,3 +641,22 @@ def get_watcher(*, profile_name: str | None = None, hermes_home: Path | None = N
     if watcher is None or not watcher.is_alive():
         watcher = start_watcher(profile_name=resolved_profile, hermes_home=resolved_home)
     return watcher
+
+
+def get_watcher_diagnostics() -> dict:
+    """Return non-mutating watcher health for the deep health endpoint."""
+    with _watcher_lock:
+        watchers = list(_watchers.values())
+    details = [watcher.diagnostics() for watcher in watchers]
+    # Stopped watchers remain in the profile registry until the next lazy
+    # restart. Their last observation error is useful diagnostics, but it must
+    # not make the currently serving WebUI unhealthy.
+    degraded = any(
+        item.get("alive") and item.get("status") == "degraded"
+        for item in details
+    )
+    return {
+        "status": "degraded" if degraded else "ok",
+        "watcher_count": len(details),
+        "watchers": details,
+    }

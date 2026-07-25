@@ -116,6 +116,27 @@ Log file:
     ~/.hermes/webui/bootstrap-8787.log   start.sh/bootstrap background server log
     ~/.hermes/webui.log                  ctl.sh daemon log
 
+Gateway session observation:
+
+- `api/gateway_watcher.py` polls the agent's `state.db` for messaging/CLI
+  session-list changes.
+- Its five-second fingerprint is limited to `sessions` rows plus one indexed
+  latest-message timestamp lookup per visible session. It must never aggregate
+  or scan the full `messages` table.
+- WAL databases retain five-second observation. DELETE/TRUNCATE/PERSIST
+  databases use lock-free file metadata while writes are active, wait 15
+  seconds after the last change, then take at most one bounded snapshot. A
+  failed snapshot backs off for 60 seconds.
+- Background watcher reads have a SQLite progress deadline. A filesystem call
+  can overshoot that target, so the quiet-window rule is the primary rollback
+  safety boundary. A timed-out projection keeps the previous sidebar snapshot
+  and retries later instead of treating observation failure as an empty list.
+- `/health?deep=1` reports watcher duration and consecutive failures. The plain
+  `/health` probe remains filesystem-independent.
+- Managed deployments may supply
+  `HERMES_WEBUI_STATE_DB_JOURNAL_MODE=truncate`; otherwise the watcher detects
+  the database mode once at startup and treats an unknown mode conservatively.
+
 ---
 
 ## 3. Runtime Environment
