@@ -26,6 +26,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+import pytest
+
 
 # ─────────────────────────── Fix 1: lifecycle leak ───────────────────────────
 
@@ -175,6 +177,7 @@ def _make_db(tmp_path: Path):
             content TEXT,
             timestamp REAL NOT NULL
         );
+        CREATE INDEX idx_messages_session ON messages(session_id, timestamp);
         """
     )
     conn.commit()
@@ -280,6 +283,217 @@ def test_cheap_fingerprint_detects_same_count_message_rewrite(tmp_path):
         "a same-count transcript rewrite moves MAX(messages.timestamp) and must "
         "invalidate the fingerprint so the watcher re-projects"
     )
+
+
+def test_cheap_fingerprint_never_aggregates_messages(tmp_path, monkeypatch):
+    """The five-second poll may use indexed point lookups, never a messages scan.
+
+    A full ``LEFT JOIN``/``GROUP BY`` reader is harmless under WAL but can hold a
+    rollback-journal SHARED lock for minutes and starve every agent writer.
+    """
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    for i in range(20):
+        _add_session(conn, f"visible-{i}", "discord", mc=5)
+
+    statements = []
+
+    def traced_open(path, log=None):
+        traced = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        traced.set_trace_callback(statements.append)
+        return traced
+
+    monkeypatch.setattr(gw, "open_state_db_readonly", traced_open)
+    assert gw._cheap_change_fingerprint(db)
+
+    sql = "\n".join(statements).lower()
+    assert "indexed by idx_messages_session" in sql
+    assert "left join messages" not in sql
+    assert "group by" not in sql
+    assert "count(" not in sql
+
+
+def test_cheap_fingerprint_does_not_build_missing_message_index(tmp_path):
+    """Old schemas degrade to sessions-only hashing without a write or scan."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    _add_session(conn, "s1", "discord", mc=1)
+    conn.execute("DROP INDEX idx_messages_session")
+    conn.commit()
+
+    assert gw._cheap_change_fingerprint(db)
+    indexes = {
+        row[1]
+        for row in conn.execute("PRAGMA index_list(messages)").fetchall()
+    }
+    assert "idx_messages_session" not in indexes
+    conn.close()
+
+
+def test_bounded_projection_releases_truncate_writer(tmp_path, monkeypatch):
+    """An over-budget watcher projection closes its SHARED lock immediately."""
+    agent_sessions = importlib.import_module("api.agent_sessions")
+    db, conn = _make_db(tmp_path)
+    conn.execute("PRAGMA journal_mode=TRUNCATE")
+    for i in range(5000):
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES ('heavy', 'user', 'x', ?)",
+            (float(i),),
+        )
+    conn.execute(
+        "INSERT INTO sessions "
+        "(id, source, model, started_at, message_count, title) "
+        "VALUES ('heavy', 'discord', 'm', 1, 5000, 'Heavy')"
+    )
+    conn.commit()
+    conn.close()
+
+    clock_calls = {"n": 0}
+
+    def expired_clock():
+        clock_calls["n"] += 1
+        return 0.0 if clock_calls["n"] == 1 else 10.0
+
+    monkeypatch.setattr(agent_sessions.time, "monotonic", expired_clock)
+    with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+        agent_sessions.read_importable_agent_session_rows(
+            db,
+            query_deadline_seconds=0.1,
+        )
+
+    # The timed-out connection is closed by ``closing(conn)``. A rollback-mode
+    # writer must therefore be able to commit immediately afterward.
+    writer = sqlite3.connect(str(db), timeout=0.5)
+    writer.execute("PRAGMA journal_mode=TRUNCATE")
+    writer.execute("UPDATE sessions SET title='Writer succeeded' WHERE id='heavy'")
+    writer.commit()
+    writer.close()
+
+
+def test_poll_timeout_keeps_previous_snapshot(tmp_path, monkeypatch):
+    """A failed observation is not an empty authoritative session list."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    _add_session(conn, "s1", "discord", mc=1)
+
+    watcher = gw.GatewayWatcher(state_db_path=db, journal_mode="wal")
+    watcher._last_cheap_fp = "old"
+    watcher._last_hash = "old-hash"
+    watcher._last_sessions = [{"session_id": "existing"}]
+
+    monkeypatch.setattr(gw, "_cheap_change_fingerprint", lambda _path: "new")
+    monkeypatch.setattr(
+        gw,
+        "_get_agent_sessions_from_db",
+        lambda _path, **_kwargs: None,
+    )
+
+    for _ in range(gw._WATCHER_DEGRADED_AFTER_ERRORS):
+        watcher._poll_once()
+
+    assert watcher._last_cheap_fp == "old"
+    assert watcher._last_hash == "old-hash"
+    assert watcher._last_sessions == [{"session_id": "existing"}]
+    diagnostics = watcher.diagnostics()
+    assert diagnostics["status"] == "degraded"
+    assert diagnostics["consecutive_errors"] == gw._WATCHER_DEGRADED_AFTER_ERRORS
+
+
+def test_truncate_watcher_waits_for_quiet_window(tmp_path, monkeypatch):
+    """Rollback mode must not open SQLite repeatedly while writers are active."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    conn.execute("PRAGMA journal_mode=TRUNCATE")
+    _add_session(conn, "s1", "discord", mc=1)
+    conn.close()
+
+    now = {"value": 100.0}
+    monkeypatch.setattr(gw.time, "monotonic", lambda: now["value"])
+    sqlite_reads = {"fingerprint": 0, "projection": 0}
+    real_fingerprint = gw._cheap_change_fingerprint
+    real_projection = gw._get_agent_sessions_from_db
+
+    def fingerprint(path):
+        sqlite_reads["fingerprint"] += 1
+        return real_fingerprint(path)
+
+    def projection(path, **kwargs):
+        sqlite_reads["projection"] += 1
+        return real_projection(path, **kwargs)
+
+    monkeypatch.setattr(gw, "_cheap_change_fingerprint", fingerprint)
+    monkeypatch.setattr(gw, "_get_agent_sessions_from_db", projection)
+    watcher = gw.GatewayWatcher(state_db_path=db, journal_mode="truncate")
+
+    watcher._poll_once()  # captures the initial stat, no SQLite read
+    now["value"] += 5
+    watcher._poll_once()  # still inside the quiet window
+    assert sqlite_reads == {"fingerprint": 0, "projection": 0}
+
+    # A commit restarts the quiet window without making the watcher a reader.
+    writer = sqlite3.connect(str(db))
+    writer.execute("UPDATE sessions SET title='changed' WHERE id='s1'")
+    writer.commit()
+    writer.close()
+    now["value"] += 5
+    watcher._poll_once()
+    assert sqlite_reads == {"fingerprint": 0, "projection": 0}
+
+    now["value"] += gw._ROLLBACK_QUIET_SECONDS + 0.1
+    watcher._poll_once()
+    assert sqlite_reads == {"fingerprint": 1, "projection": 1}
+
+    # The same committed stat is processed once, not every five seconds.
+    now["value"] += 5
+    watcher._poll_once()
+    assert sqlite_reads == {"fingerprint": 1, "projection": 1}
+
+
+def test_truncate_watcher_processes_excluded_change_once(tmp_path, monkeypatch):
+    """A cron-only commit must not reopen rollback SQLite every five seconds."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    conn.execute("PRAGMA journal_mode=TRUNCATE")
+    _add_session(conn, "visible", "discord", mc=1)
+    _add_session(conn, "excluded", "cron", mc=1)
+    conn.close()
+
+    now = {"value": 100.0}
+    monkeypatch.setattr(gw.time, "monotonic", lambda: now["value"])
+    sqlite_reads = {"fingerprint": 0, "projection": 0}
+    real_fingerprint = gw._cheap_change_fingerprint
+
+    def fingerprint(path):
+        sqlite_reads["fingerprint"] += 1
+        return real_fingerprint(path)
+
+    monkeypatch.setattr(gw, "_cheap_change_fingerprint", fingerprint)
+    monkeypatch.setattr(
+        gw,
+        "_get_agent_sessions_from_db",
+        lambda _path, **_kwargs: sqlite_reads.__setitem__(
+            "projection", sqlite_reads["projection"] + 1
+        ),
+    )
+    watcher = gw.GatewayWatcher(state_db_path=db, journal_mode="truncate")
+    watcher._last_cheap_fp = real_fingerprint(db)
+
+    watcher._poll_once()  # capture the initial stat
+    writer = sqlite3.connect(str(db))
+    writer.execute(
+        "UPDATE sessions SET title='cron changed' WHERE id='excluded'"
+    )
+    writer.commit()
+    writer.close()
+    now["value"] += 5
+    watcher._poll_once()  # capture the changed stat
+    now["value"] += gw._ROLLBACK_QUIET_SECONDS + 0.1
+    watcher._poll_once()  # one indexed read proves visible state is unchanged
+    now["value"] += 5
+    watcher._poll_once()  # the committed stat is already processed
+
+    assert sqlite_reads == {"fingerprint": 1, "projection": 0}
 
 
 def test_cheap_fingerprint_detects_lineage_only_change(tmp_path):

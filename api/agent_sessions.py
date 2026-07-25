@@ -1,6 +1,7 @@
 """Shared helpers for reading Hermes Agent sessions from state.db."""
 import logging
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 
@@ -37,6 +38,40 @@ def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> 
             exc,
         )
         return sqlite3.connect(str(db_path))
+
+
+def configure_state_db_read_deadline(
+    conn: sqlite3.Connection,
+    deadline_seconds: float | None,
+) -> None:
+    """Bound a background ``state.db`` read without changing query results.
+
+    Rollback-journal deployments cannot let an observational reader retain a
+    SHARED lock indefinitely: writers need every reader to leave before commit.
+    SQLite's connection timeout only governs waiting to *acquire* a lock; it
+    does not stop a query that already owns a read lock. A progress handler
+    interrupts at the next SQLite VM callback after the deadline. A blocked
+    filesystem syscall can overshoot that target, which is why rollback-mode
+    callers also wait for a database quiet window before opening a reader.
+
+    ``None`` preserves the historical unbounded behavior for interactive reads.
+    The gateway watcher supplies a short deadline because its result is
+    best-effort and it polls again automatically.
+    """
+    if deadline_seconds is None:
+        return
+    try:
+        bounded_seconds = max(0.01, float(deadline_seconds))
+    except (TypeError, ValueError):
+        return
+    deadline = time.monotonic() + bounded_seconds
+    conn.execute(
+        f"PRAGMA busy_timeout={max(1, min(250, int(bounded_seconds * 1000)))}"
+    )
+    conn.set_progress_handler(
+        lambda: 1 if time.monotonic() >= deadline else 0,
+        1000,
+    )
 
 
 MESSAGING_SOURCES = {
@@ -496,6 +531,8 @@ def read_importable_agent_session_rows(
     log=None,
     exclude_sources: tuple[str, ...] | None = ("cron", "webui"),
     include_sources: tuple[str, ...] | None = None,
+    *,
+    query_deadline_seconds: float | None = None,
 ) -> list[dict]:
     """Return agent sessions projected as importable conversations.
 
@@ -535,6 +572,7 @@ def read_importable_agent_session_rows(
         conn = sqlite3.connect(str(db_path))
     with closing(conn):
         conn.row_factory = sqlite3.Row
+        configure_state_db_read_deadline(conn, query_deadline_seconds)
         cur = conn.cursor()
 
         # Older Hermes Agent versions may not have source tracking. Without a

@@ -11208,6 +11208,16 @@ def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
     if checks["streams_lock"].get("status") != "ok":
         return checks, False
 
+    try:
+        from api.gateway_watcher import get_watcher_diagnostics
+
+        checks["gateway_watcher"] = get_watcher_diagnostics()
+    except Exception as exc:
+        checks["gateway_watcher"] = {
+            "status": "error",
+            "error": type(exc).__name__,
+        }
+
     t0 = time.time()
     try:
         sessions = all_sessions()
