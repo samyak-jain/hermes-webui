@@ -131,6 +131,10 @@ Gateway session observation:
   can overshoot that target, so the quiet-window rule is the primary rollback
   safety boundary. A timed-out projection keeps the previous sidebar snapshot
   and retries later instead of treating observation failure as an empty list.
+- In a managed rollback-journal deployment, all other WebUI reads of the live
+  agent database receive a two-second progress deadline. New SSE connections
+  use the watcher's last successful snapshot and never launch a duplicate
+  unbounded projection.
 - `/health?deep=1` reports watcher duration and consecutive failures. The plain
   `/health` probe remains filesystem-independent.
 - Managed deployments may supply

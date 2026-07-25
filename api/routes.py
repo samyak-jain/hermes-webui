@@ -39,6 +39,7 @@ from api.agent_sessions import (
     _looks_like_default_cli_title,
     is_cli_session_row,
     is_cli_session_row_visible,
+    open_state_db_readonly,
     read_session_lineage_report,
 )
 from api.compression_anchor import visible_messages_for_anchor
@@ -313,7 +314,7 @@ def _latest_cron_session_info_for_jobs(
     if not db_path or not Path(db_path).exists():
         return {jid: {"session_id": "", "message_count": None} for jid in requested}
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(open_state_db_readonly(Path(db_path), log=logger)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
@@ -10612,7 +10613,7 @@ def _handle_insights(handler, parsed) -> bool:
         from api.models import _active_state_db_path
         db_path = _active_state_db_path()
         if db_path and db_path.exists():
-            with closing(sqlite3.connect(str(db_path))) as conn:
+            with closing(open_state_db_readonly(Path(db_path), log=logger)) as conn:
                 conn.row_factory = sqlite3.Row
                 cur = conn.cursor()
                 # cache_read_tokens may not exist on older agent state DBs;
@@ -11257,7 +11258,7 @@ def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
                 "ms": round((time.time() - t0) * 1000, 1),
             }
         else:
-            with closing(sqlite3.connect(str(db_path))) as conn:
+            with closing(open_state_db_readonly(Path(db_path), log=logger)) as conn:
                 conn.execute("PRAGMA schema_version").fetchone()
             checks["state_db"] = {
                 "status": "ok",
@@ -17503,9 +17504,16 @@ def _handle_gateway_sse_stream(handler, parsed):
 
     q = watcher.subscribe()
     try:
-        # Send initial snapshot immediately
-        from api.models import get_cli_sessions
-        initial = get_cli_sessions()
+        # Send the watcher's last successful snapshot immediately. Opening a
+        # second unbounded state.db projection here can retain a rollback-mode
+        # SHARED lock even after the client disconnects, starving the agent's
+        # commits for minutes. Older test doubles fall back to the historical
+        # path for compatibility.
+        if hasattr(watcher, "snapshot") and callable(watcher.snapshot):
+            initial = watcher.snapshot()
+        else:
+            from api.models import get_cli_sessions
+            initial = get_cli_sessions()
         _sse(handler, 'sessions_changed', {'sessions': initial})
 
         while True:

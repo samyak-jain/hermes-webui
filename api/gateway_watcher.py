@@ -349,6 +349,16 @@ class GatewayWatcher:
                     logger.debug("Failed to send stop sentinel to late subscriber")
         return q
 
+    def snapshot(self) -> list:
+        """Return the last successfully observed session projection.
+
+        SSE connection setup must never run a second unbounded ``state.db``
+        projection. The watcher owns database observation; subscribers receive a
+        shallow copy of its cache and a later change event if the first
+        rollback-safe snapshot is still pending.
+        """
+        return list(self._last_sessions)
+
     def unsubscribe(self, q: queue.Queue):
         """Remove a subscriber queue."""
         with self._sub_lock:

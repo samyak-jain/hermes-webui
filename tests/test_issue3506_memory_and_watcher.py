@@ -371,6 +371,51 @@ def test_bounded_projection_releases_truncate_writer(tmp_path, monkeypatch):
     writer.close()
 
 
+def test_managed_truncate_defaults_every_agent_read_to_deadline(
+    tmp_path,
+    monkeypatch,
+):
+    """Non-watcher session reads must not retain rollback SHARED locks forever."""
+    agent_sessions = importlib.import_module("api.agent_sessions")
+    db, conn = _make_db(tmp_path)
+    _add_session(conn, "s1", "discord", mc=1)
+    conn.close()
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_JOURNAL_MODE", "truncate")
+
+    deadlines = []
+
+    def record_deadline(_conn, deadline):
+        deadlines.append(deadline)
+
+    monkeypatch.setattr(
+        agent_sessions,
+        "configure_state_db_read_deadline",
+        record_deadline,
+    )
+    with agent_sessions.open_state_db_readonly(db) as readonly:
+        readonly.execute("SELECT 1").fetchone()
+    agent_sessions.read_importable_agent_session_rows(db)
+
+    assert deadlines == [
+        agent_sessions._ROLLBACK_READ_DEADLINE_SECONDS,
+        agent_sessions._ROLLBACK_READ_DEADLINE_SECONDS,
+    ]
+
+
+def test_watcher_snapshot_is_a_copy(tmp_path):
+    """SSE setup can reuse cached rows without opening the agent database."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    conn.close()
+    watcher = gw.GatewayWatcher(state_db_path=db, journal_mode="truncate")
+    watcher._last_sessions = [{"session_id": "cached"}]
+
+    snapshot = watcher.snapshot()
+    snapshot.append({"session_id": "caller-owned"})
+
+    assert watcher.snapshot() == [{"session_id": "cached"}]
+
+
 def test_poll_timeout_keeps_previous_snapshot(tmp_path, monkeypatch):
     """A failed observation is not an empty authoritative session list."""
     gw = importlib.import_module("api.gateway_watcher")
