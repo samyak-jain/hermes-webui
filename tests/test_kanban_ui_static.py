@@ -637,8 +637,6 @@ def test_kanban_dashboard_parity_core_controls_are_native():
     assert "async function bulkUpdateKanban" in PANELS
     assert "async function refreshKanbanEvents" in PANELS
     for endpoint in (
-        "'/api/kanban/stats'",
-        "'/api/kanban/assignees'",
         "'/api/kanban/events'",
         "'/api/kanban/dispatch'",
         "'/api/kanban/tasks/bulk'",
@@ -657,6 +655,92 @@ def test_kanban_dashboard_parity_core_controls_are_native():
     ), "Kanban must subscribe to live events via SSE or polling"
     assert "prompt(" not in PANELS
     assert "confirm(" not in PANELS
+
+
+def test_kanban_initial_load_parallelizes_metadata_and_avoids_redundant_reads():
+    """The board must not regress to the five-request serial waterfall."""
+    import subprocess
+
+    load_kanban = extract_function(PANELS, "loadKanban", prefix="async function")
+    script = load_kanban + r"""
+const assert = require('assert');
+
+function deferred() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return {promise, resolve};
+}
+
+const boardsGate = deferred();
+const configGate = deferred();
+const boardGate = deferred();
+const calls = [];
+const elements = {
+  kanbanBoard: {innerHTML: ''},
+  kanbanList: {innerHTML: ''},
+};
+
+let _kanbanBoard = null;
+let _kanbanCurrentBoard = null;
+let _kanbanLatestEventId = 0;
+function $(id) { return elements[id] || null; }
+function esc(value) { return String(value == null ? '' : value); }
+function t(key) { return key; }
+function _kanbanApplyConfigDefaults() {}
+function _kanbanCurrentFilters() {
+  return {assignee: '', tenant: '', includeArchived: false, onlyMine: false};
+}
+function _kanbanSetSelectOptions() {}
+function _kanbanStartPolling() {}
+function _kanbanRenderBoard() {}
+function _kanbanRenderStats() {}
+function _kanbanBoardQuery() { return ''; }
+const document = {querySelector() { return null; }};
+
+function loadKanbanBoards() {
+  calls.push('/api/kanban/boards');
+  return boardsGate.promise;
+}
+
+function api(path) {
+  calls.push(path);
+  if (path.startsWith('/api/kanban/config')) return configGate.promise;
+  if (path.startsWith('/api/kanban/board')) return boardGate.promise;
+  throw new Error('unexpected request: ' + path);
+}
+
+(async () => {
+  const loading = loadKanban(false);
+  await new Promise(setImmediate);
+  assert.deepStrictEqual(
+    calls,
+    ['/api/kanban/boards', '/api/kanban/config'],
+    'boards and config must start in the same request wave'
+  );
+
+  boardsGate.resolve();
+  configGate.resolve({columns: ['triage', 'todo', 'ready', 'running', 'blocked', 'done']});
+  await new Promise(setImmediate);
+  assert.strictEqual(calls.length, 3);
+  assert.ok(calls[2].startsWith('/api/kanban/board'));
+
+  boardGate.resolve({
+    columns: [],
+    assignees: [],
+    tenants: [],
+    latest_event_id: 0,
+    stats: {by_status: {}},
+  });
+  await loading;
+
+  assert.strictEqual(calls.filter(path => path.includes('/assignees')).length, 0);
+  assert.strictEqual(calls.filter(path => path.includes('/stats')).length, 0);
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+    subprocess.run(["node", "-e", script], check=True, text=True)
 
 
 def test_kanban_dashboard_parity_i18n_keys_exist():
@@ -992,9 +1076,7 @@ def test_kanban_board_param_is_plumbed_into_api_calls():
     assert "_kanbanBoardQuery" in PANELS
     # Spot-check critical call sites
     assert "/api/kanban/board' + (params.toString()" in PANELS  # board with filters
-    assert "/api/kanban/config' + _kanbanBoardQuery()" in PANELS
-    assert "/api/kanban/stats' + _kanbanBoardQuery()" in PANELS
-    assert "/api/kanban/assignees' + _kanbanBoardQuery()" in PANELS
+    assert "api('/api/kanban/config')" in PANELS
 
 
 def test_kanban_active_board_persisted_to_localstorage():

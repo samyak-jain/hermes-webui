@@ -2669,13 +2669,13 @@ async function loadKanban(animate){
   const list = $('kanbanList');
   try {
     if (animate && board) board.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:13px">${esc(t('loading'))}</div>`;
-    // Resolve the active board before board-scoped requests. If another CLI or
-    // tab archived the previous board, /boards can fall back to default instead
-    // of leaving config/board pinned to a ghost slug.
-    await loadKanbanBoards();
-    const config = await api('/api/kanban/config' + _kanbanBoardQuery());
-    let assignees = null;
-    try { assignees = await api('/api/kanban/assignees' + _kanbanBoardQuery()); } catch(e) { assignees = null; }
+    // Board discovery and global display config are independent, so start them
+    // together. The task request remains in the second wave because it needs
+    // both the resolved active board and config-derived filter defaults.
+    const [, config] = await Promise.all([
+      loadKanbanBoards(),
+      api('/api/kanban/config'),
+    ]);
     _kanbanApplyConfigDefaults(config);
     const filters = _kanbanCurrentFilters();
     const params = new URLSearchParams();
@@ -2699,9 +2699,9 @@ async function loadKanban(animate){
       const ro = document.querySelector('.kanban-readonly');
       if (ro) ro.style.display = _kanbanBoard.read_only ? '' : 'none';
     } catch(_) {}
-    _kanbanSetSelectOptions($('kanbanAssigneeFilter'), _kanbanBoard.assignees || (assignees && assignees.assignees) || (config && config.assignees), 'kanban_all_assignees');
+    _kanbanSetSelectOptions($('kanbanAssigneeFilter'), _kanbanBoard.assignees || [], 'kanban_all_assignees');
     _kanbanSetSelectOptions($('kanbanTenantFilter'), _kanbanBoard.tenants, 'kanban_all_tenants');
-    await loadKanbanStats();
+    _kanbanRenderStats(_kanbanBoard.stats || {});
     // Note: PR #1828 (v0.51.20) moved the boards refresh to the start of
     // loadKanban() so the active board is resolved BEFORE board-scoped
     // requests fire. The previous tail-of-function refresh has been removed
@@ -2720,18 +2720,15 @@ async function loadKanban(animate){
 
 function filterKanban(){ _kanbanRenderBoard(); }
 
-async function loadKanbanStats(){
-  try {
-    const stats = await api('/api/kanban/stats' + _kanbanBoardQuery());
-    const el = $('kanbanStats');
-    if (!el) return;
-    const byStatus = (stats && stats.by_status) || {};
-    const total = Object.values(byStatus).reduce((a, b) => a + Number(b || 0), 0);
-    const cells = Object.entries(byStatus).sort(([a], [b]) => a.localeCompare(b)).map(([status, count]) =>
-      `<span class="kanban-stat-cell"><strong>${esc(String(count))}</strong> ${esc(_kanbanColumnLabel(status))}</span>`
-    ).join('');
-    el.innerHTML = `<div class="kanban-stats-grid"><span class="kanban-stat-cell total"><strong>${esc(String(total))}</strong> ${esc(t('kanban_stats'))}</span>${cells}</div>`;
-  } catch(e) { /* stats are best-effort */ }
+function _kanbanRenderStats(stats){
+  const el = $('kanbanStats');
+  if (!el) return;
+  const byStatus = (stats && stats.by_status) || {};
+  const total = Object.values(byStatus).reduce((a, b) => a + Number(b || 0), 0);
+  const cells = Object.entries(byStatus).sort(([a], [b]) => a.localeCompare(b)).map(([status, count]) =>
+    `<span class="kanban-stat-cell"><strong>${esc(String(count))}</strong> ${esc(_kanbanColumnLabel(status))}</span>`
+  ).join('');
+  el.innerHTML = `<div class="kanban-stats-grid"><span class="kanban-stat-cell total"><strong>${esc(String(total))}</strong> ${esc(t('kanban_stats'))}</span>${cells}</div>`;
 }
 
 async function refreshKanbanEvents(){
