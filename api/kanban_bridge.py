@@ -80,8 +80,7 @@ def _normalise_board_or_raise(raw):
 
 
 def _conn(board=None):
-    """Initialize the kanban DB for the given board slug and return a context manager
-    that yields a sqlite connection and CLOSES it on exit.
+    """Return a context manager that opens the selected board and closes it.
 
     Must be ``kb.connect_closing`` — a raw ``kb.connect()`` connection used as
     ``with _conn(...) as conn:`` only gets sqlite3's transaction-scope context
@@ -89,9 +88,13 @@ def _conn(board=None):
     that leaks one FD per request and pins stale WAL snapshots (FDs to deleted
     ``-wal``/``-shm`` files), which starves SQLite checkpoints on the shared
     kanban DB and aggravates probe⇄checkpoint contention for every process.
+
+    Do not call ``kb.init_db`` here. ``kb.connect`` owns first-open schema
+    initialization and caches it by database path. Explicit ``init_db`` is the
+    force-migration API: it invalidates that cache and reruns the integrity and
+    migration pass, which is especially expensive on network filesystems.
     """
     kb = _kb()
-    kb.init_db(board=board)
     closing = getattr(kb, "connect_closing", None)
     if closing is not None:
         return closing(board=board)
@@ -190,6 +193,25 @@ def _comment_counts(conn):
     return {row["task_id"]: int(row["n"] or 0) for row in rows}
 
 
+def _stats_from_conn(conn):
+    """Return board statistics using an already-open request connection."""
+    kb = _kb()
+    if hasattr(kb, "board_stats"):
+        return kb.board_stats(conn)
+    rows = conn.execute(
+        "SELECT status, assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status != 'archived' GROUP BY status, assignee"
+    ).fetchall()
+    by_status = {}
+    by_assignee = {}
+    for row in rows:
+        n = int(row["n"] or 0)
+        by_status[row["status"]] = by_status.get(row["status"], 0) + n
+        assignee = row["assignee"] or "unassigned"
+        by_assignee[assignee] = by_assignee.get(assignee, 0) + n
+    return {"by_status": by_status, "by_assignee": by_assignee}
+
+
 def _board_payload(parsed):
     """Build the full board JSON payload: kanban columns with tasks, filter state, and latest_event_id."""
     board = _resolve_board(parsed)
@@ -222,6 +244,13 @@ def _board_payload(parsed):
         )
         link_counts = _task_link_counts(conn, tasks)
         comment_counts = _comment_counts(conn)
+        try:
+            stats = _stats_from_conn(conn)
+        except Exception:
+            # Statistics were a separate best-effort request before they were
+            # folded into the board payload; keep a stats failure from hiding
+            # otherwise valid task data.
+            stats = {}
 
         def row(task):
             data = _task_dict(task)
@@ -242,6 +271,7 @@ def _board_payload(parsed):
             "columns": columns,
             "tenants": sorted({task.tenant for task in tasks if getattr(task, "tenant", None)}),
             "assignees": sorted({task.assignee for task in tasks if getattr(task, "assignee", None)}),
+            "stats": stats,
             "latest_event_id": latest_event_id,
             "changed": True,
             "read_only": False,
@@ -618,21 +648,8 @@ def _update_config_payload(body):
 
 def _stats_payload(*, board=None):
     """Return per-status and per-assignee task counts for the board."""
-    kb = _kb()
     with _conn(board=board) as conn:
-        if hasattr(kb, "board_stats"):
-            return kb.board_stats(conn)
-        rows = conn.execute(
-            "SELECT status, assignee, COUNT(*) AS n FROM tasks WHERE status != 'archived' GROUP BY status, assignee"
-        ).fetchall()
-        by_status = {}
-        by_assignee = {}
-        for row in rows:
-            n = int(row["n"] or 0)
-            by_status[row["status"]] = by_status.get(row["status"], 0) + n
-            assignee = row["assignee"] or "unassigned"
-            by_assignee[assignee] = by_assignee.get(assignee, 0) + n
-        return {"by_status": by_status, "by_assignee": by_assignee}
+        return _stats_from_conn(conn)
 
 
 def _assignees_payload(*, board=None):

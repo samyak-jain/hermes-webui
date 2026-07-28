@@ -111,10 +111,16 @@ def test_inner_handler_bad_response_does_not_emit_double_404(
     assert payload["error"] == payload_error
 
 
-def test_kanban_load_resolves_board_before_board_scoped_requests():
-    boards_pos = PANELS.find("await loadKanbanBoards();")
-    config_pos = PANELS.find("api('/api/kanban/config' + _kanbanBoardQuery())")
+def test_kanban_load_resolves_board_before_board_task_request():
+    first_wave_pos = PANELS.find("const [, config] = await Promise.all([")
+    boards_pos = PANELS.find("loadKanbanBoards()", first_wave_pos)
+    config_pos = PANELS.find("api('/api/kanban/config')", first_wave_pos)
+    board_scope_pos = PANELS.find("params.set('board', _kanbanCurrentBoard)", first_wave_pos)
+    board_request_pos = PANELS.find("const data = await api(path)", first_wave_pos)
+    assert first_wave_pos != -1
     assert boards_pos != -1
     assert config_pos != -1
-    assert boards_pos < config_pos
+    assert board_scope_pos != -1
+    assert board_request_pos != -1
+    assert boards_pos < board_scope_pos < board_request_pos
     assert "_kanbanSetSavedBoard('default');" in PANELS

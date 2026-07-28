@@ -106,6 +106,9 @@ class FakeConn:
 
 class FakeKanbanDB:
     def __init__(self):
+        self.init_calls = 0
+        self.connect_calls = 0
+        self.recompute_calls = 0
         self.tasks = [
             FakeTask("t_1", "Read-only board target", "ready", "webui-test", tenant="webui"),
             FakeTask("t_2", "Blocked target", "blocked", "other", tenant="ops"),
@@ -120,9 +123,11 @@ class FakeKanbanDB:
         # board param accepted but ignored — the fake stores everything
         # in a single in-memory list for test simplicity. Real kanban_db
         # uses the param to pick which sqlite file to open.
+        self.init_calls += 1
         return None
 
     def connect(self, *, board=None):
+        self.connect_calls += 1
         return FakeConn(self.tasks, self.events)
 
     def list_tasks(self, conn, tenant=None, assignee=None, include_archived=False, **_kwargs):
@@ -230,6 +235,10 @@ class FakeKanbanDB:
             assignee = task.assignee or "unassigned"
             by_assignee[assignee] = by_assignee.get(assignee, 0) + 1
         return {"by_status": by_status, "by_assignee": by_assignee}
+
+    def recompute_ready(self, conn):
+        self.recompute_calls += 1
+        return 0
 
     def read_worker_log(self, task_id, tail_bytes=None):
         return f"worker log for {task_id}"
@@ -382,11 +391,33 @@ def test_kanban_board_payload_exposes_read_only_board(monkeypatch):
     # The bridge has been writable since #1649; this PR makes the read_only
     # flag honest (was hardcoded True even when fully writable).
     assert data["read_only"] is False
+    assert data["stats"]["by_status"] == {"ready": 1, "blocked": 1}
     names = [column["name"] for column in data["columns"]]
     for expected in ("triage", "todo", "ready", "running", "blocked", "done"):
         assert expected in names
     all_tasks = [task for column in data["columns"] for task in column["tasks"]]
     assert any(task["id"] == "t_1" and task["title"] == "Read-only board target" for task in all_tasks)
+
+
+def test_kanban_read_paths_do_not_force_database_reinitialization(monkeypatch):
+    """Opening a connection is the agent library's schema-init boundary.
+
+    The bridge must not call ``init_db`` before every request: modern
+    ``kanban_db.connect`` auto-initializes once and then uses its process cache,
+    while explicit ``init_db`` deliberately invalidates that cache and reruns
+    integrity checks plus migrations.
+    """
+    bridge = _load_bridge(monkeypatch)
+    fake_kanban = sys.modules["hermes_cli.kanban_db"]
+
+    bridge._board_payload(_parsed())
+    bridge._config_payload()
+    bridge._assignees_payload()
+    bridge._stats_payload()
+
+    assert fake_kanban.init_calls == 0
+    assert fake_kanban.connect_calls == 4
+    assert fake_kanban.recompute_calls == 0
 
 
 def test_board_pointer_drift_falls_back_to_default(monkeypatch):
