@@ -11,9 +11,9 @@ name: Browser smoke
 
 on:
   pull_request:
-    branches: [master]
+    branches: [master, kumo/v0.52.41]
   push:
-    branches: [master]
+    branches: [master, kumo/v0.52.41]
 
 jobs:
   browser-smoke:

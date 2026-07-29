@@ -399,6 +399,17 @@ def test_kanban_board_payload_exposes_read_only_board(monkeypatch):
     assert any(task["id"] == "t_1" and task["title"] == "Read-only board target" for task in all_tasks)
 
 
+def test_assignee_filter_keeps_full_board_assignee_option_universe(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+
+    data = bridge._board_payload(_parsed(query="assignee=webui-test"))
+
+    visible_tasks = [task for column in data["columns"] for task in column["tasks"]]
+    assert [task["id"] for task in visible_tasks] == ["t_1"]
+    assert data["filters"]["assignee"] == "webui-test"
+    assert data["assignees"] == ["other", "webui-test"]
+
+
 def test_kanban_read_paths_do_not_force_database_reinitialization(monkeypatch):
     """Opening a connection is the agent library's schema-init boundary.
 
@@ -418,6 +429,42 @@ def test_kanban_read_paths_do_not_force_database_reinitialization(monkeypatch):
     assert fake_kanban.init_calls == 0
     assert fake_kanban.connect_calls == 4
     assert fake_kanban.recompute_calls == 0
+
+
+def test_kanban_board_payload_500_task_p95_stays_below_half_second(monkeypatch):
+    """Guard the CPU-side portion of the warm board-load latency budget.
+
+    The fixed fixture has 500 active tasks spread across six columns,
+    25 assignees, and 10 tenants. After one warm-up, 20 samples must keep
+    p95 below 500 ms. This deliberately generous ceiling is robust on shared
+    CI runners while still catching accidental quadratic work. Storage/network
+    latency and blocking initialization are covered separately by the
+    request-count and initialization invariants.
+    """
+    bridge = _load_bridge(monkeypatch)
+    fake_kanban = sys.modules["hermes_cli.kanban_db"]
+    statuses = ("triage", "todo", "ready", "running", "blocked", "done")
+    fake_kanban.tasks = [
+        FakeTask(
+            f"t_perf_{index}",
+            f"Performance fixture task {index}",
+            statuses[index % len(statuses)],
+            f"assignee-{index % 25:02d}",
+            f"tenant-{index % 10:02d}",
+        )
+        for index in range(500)
+    ]
+
+    bridge._board_payload(_parsed())
+    samples = []
+    for _ in range(20):
+        started = time.perf_counter()
+        data = bridge._board_payload(_parsed())
+        samples.append(time.perf_counter() - started)
+        assert sum(len(column["tasks"]) for column in data["columns"]) == 500
+
+    p95_seconds = sorted(samples)[18]
+    assert p95_seconds < 0.5, f"500-task board payload p95 was {p95_seconds:.3f}s"
 
 
 def test_board_pointer_drift_falls_back_to_default(monkeypatch):

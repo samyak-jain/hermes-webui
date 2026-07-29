@@ -212,6 +212,19 @@ def _stats_from_conn(conn):
     return {"by_status": by_status, "by_assignee": by_assignee}
 
 
+def _assignees_from_conn(conn):
+    """Return every assignee known to the board using an existing connection."""
+    kb = _kb()
+    try:
+        return sorted(kb.known_assignees(conn))
+    except Exception:
+        rows = conn.execute(
+            "SELECT DISTINCT assignee FROM tasks "
+            "WHERE assignee IS NOT NULL AND assignee != '' ORDER BY assignee"
+        ).fetchall()
+        return [row["assignee"] for row in rows]
+
+
 def _board_payload(parsed):
     """Build the full board JSON payload: kanban columns with tasks, filter state, and latest_event_id."""
     board = _resolve_board(parsed)
@@ -251,6 +264,12 @@ def _board_payload(parsed):
             # folded into the board payload; keep a stats failure from hiding
             # otherwise valid task data.
             stats = {}
+        try:
+            assignees = _assignees_from_conn(conn)
+        except Exception:
+            # Keep the board usable with older Agent database implementations,
+            # while preferring the full-board option universe when available.
+            assignees = sorted({task.assignee for task in tasks if getattr(task, "assignee", None)})
 
         def row(task):
             data = _task_dict(task)
@@ -270,7 +289,7 @@ def _board_payload(parsed):
         return {
             "columns": columns,
             "tenants": sorted({task.tenant for task in tasks if getattr(task, "tenant", None)}),
-            "assignees": sorted({task.assignee for task in tasks if getattr(task, "assignee", None)}),
+            "assignees": assignees,
             "stats": stats,
             "latest_event_id": latest_event_id,
             "changed": True,
@@ -654,15 +673,8 @@ def _stats_payload(*, board=None):
 
 def _assignees_payload(*, board=None):
     """Return the list of known assignees derived from task history."""
-    kb = _kb()
     with _conn(board=board) as conn:
-        try:
-            assignees = list(kb.known_assignees(conn))
-        except Exception:
-            rows = conn.execute(
-                "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND assignee != '' ORDER BY assignee"
-            ).fetchall()
-            assignees = [row["assignee"] for row in rows]
+        assignees = _assignees_from_conn(conn)
     return {"assignees": assignees}
 
 
