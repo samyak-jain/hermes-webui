@@ -40,6 +40,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
+            type=raw,value=${{ github.ref_name }},priority=1000
             type=match,pattern=v(\d+\.\d+(?:\.\d+)?),group=1
             type=raw,value=latest
 

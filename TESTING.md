@@ -15,6 +15,38 @@
 
 ---
 
+## Kanban board-load latency acceptance
+
+The maintenance-line Kanban performance contract has complementary deterministic
+and timed gates:
+
+- A warm board load performs exactly three HTTP requests in two waves:
+  `/boards` and `/config` concurrently, then `/board`. It must not restore the
+  separate initial `/assignees` or `/stats` reads.
+- A board request opens one request-local database connection and makes zero
+  explicit `init_db()` calls. The Agent library owns its legitimate one-time
+  first-connection initialization.
+- The CPU-side reference fixture contains 500 active tasks spread across six
+  columns, 25 assignees, and 10 tenants. After one warm-up,
+  `tests/test_kanban_bridge.py` measures 20 complete payload builds; p95 must be
+  below 500 ms.
+
+The 500 ms CPU threshold is intentionally generous for shared CI runners; the
+fixture normally has ample headroom, while a quadratic serialization regression
+would still breach it. It excludes storage and transport variance, which the
+request-count and no-forced-initialization gates constrain without a flaky
+wall-clock assertion.
+
+For an isolated network-filesystem benchmark with the same 500/25/10 dataset,
+the warm acceptance bounds are p95 <= 750 ms for `/api/kanban/board` and
+p95 <= 1.5 s from the first metadata request until the board response completes,
+over 20 loads after one unmeasured warm-up. Record task/assignee/tenant counts
+with the result, and seed isolated state rather than a real operator board.
+Cold process initialization is reported separately because it legitimately
+includes the Agent library's once-per-process schema check.
+
+---
+
 ## Static JS runtime lint (brick-class regression guard)
 
 Some JS bugs throw a `TypeError`/`ReferenceError` only when a specific function
