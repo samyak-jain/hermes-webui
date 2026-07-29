@@ -449,7 +449,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         """Handle CORS preflight requests (headers emitted by api.routes)."""
         self._req_t0 = time.time()
-        if _is_verifier_only_path(urlparse(self.path).path):
+        if _is_verifier_only_path(urlparse(getattr(self, "path", "/")).path):
             return j(self, {"error": "not found"}, status=404)
         self.send_response(200)
         apply_cors_preflight_headers(self)
