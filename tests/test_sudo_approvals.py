@@ -1,9 +1,10 @@
-"""Security contract tests for request-bound sudo WebAuthn approvals."""
+"""Security contract tests for integrated request-bound sudo approvals."""
 from __future__ import annotations
 
+import copy
 import hashlib
+import io
 import json
-import os
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -20,7 +21,10 @@ from api.sudo_approvals import (
     SudoApprovalExpired,
     SudoApprovalUnauthorized,
     _b64u,
+    _canonical_json,
+    _request_digest,
     config_from_env,
+    validate_broker_authorization,
     validate_browser_origin,
     validate_request_host,
 )
@@ -28,8 +32,13 @@ from api.sudo_approvals import (
 
 ORIGIN = "https://approval.example.test"
 RP_ID = "approval.example.test"
-COMMAND = "/usr/bin/systemctl restart exact.service"
-REQUESTER = "paseo:actor:trusted-123"
+BROKER_ID = "samyak-desktop"
+BROKER_TOKEN = "test-broker-token-" + ("x" * 32)
+REQUEST_ID = "11111111-1111-4111-8111-111111111111"
+BROKER_NONCE = _b64u(hashlib.sha256(b"broker-nonce").digest())
+COMMAND_ARGV = ["/usr/bin/systemctl", "restart", "exact service.service"]
+COMMAND = "/usr/bin/systemctl restart 'exact service.service'"
+REQUESTER = "paseo:worker-123"
 _CREDENTIAL_ID = b"deterministic-approval-credential"
 
 
@@ -70,9 +79,7 @@ def _cbor(value) -> bytes:
     if value is None:
         return b"\xf6"
     if isinstance(value, int):
-        if value >= 0:
-            return _cbor_length(0, value)
-        return _cbor_length(1, -1 - value)
+        return _cbor_length(0 if value >= 0 else 1, value if value >= 0 else -1 - value)
     if isinstance(value, bytes):
         return _cbor_length(2, len(value)) + value
     if isinstance(value, str):
@@ -123,13 +130,14 @@ def _registration_payload(challenge: str, private_key, *, flags: int = 0x45):
         + _cbor(cose_key)
     )
     attestation = _cbor({"fmt": "none", "attStmt": {}, "authData": auth_data})
-    raw_client = _client_data(challenge, ceremony="webauthn.create")
     return {
         "id": _b64u(_CREDENTIAL_ID),
         "rawId": _b64u(_CREDENTIAL_ID),
         "type": "public-key",
         "response": {
-            "clientDataJSON": _b64u(raw_client),
+            "clientDataJSON": _b64u(
+                _client_data(challenge, ceremony="webauthn.create")
+            ),
             "attestationObject": _b64u(attestation),
         },
     }
@@ -143,9 +151,10 @@ def _assertion_payload(
     flags: int = 0x05,
     sign_count: int = 1,
     origin: str = ORIGIN,
+    rp_id: str = RP_ID,
 ):
     auth_data = (
-        hashlib.sha256(RP_ID.encode()).digest()
+        hashlib.sha256(rp_id.encode()).digest()
         + bytes([flags])
         + sign_count.to_bytes(4, "big")
     )
@@ -167,248 +176,299 @@ def _assertion_payload(
     }
 
 
+def _transaction(clock: Clock, **changes):
+    value = {
+        "protocol_version": 1,
+        "purpose": "sudo-approval/v1",
+        "request_id": REQUEST_ID,
+        "argv": list(COMMAND_ARGV),
+        "command": COMMAND,
+        "cwd": "/tmp",
+        "requester_uid": 1000,
+        "requester_worker_id": REQUESTER,
+        "broker_id": BROKER_ID,
+        "broker_nonce": BROKER_NONCE,
+        "created_at": clock.value,
+        "expires_at": clock.value + 90,
+    }
+    value.update(changes)
+    return value
+
+
+def _envelope(transaction, *, digest=None):
+    return {
+        "protocol_version": 1,
+        "request": transaction,
+        "request_digest": digest or _request_digest(transaction),
+    }
+
+
+def _url_capability(registration):
+    parts = urlparse(registration["approval_url"]).path.split("/")
+    return parts[-2], parts[-1]
+
+
 @pytest.fixture
 def verifier(tmp_path):
     clock = Clock()
+    token_file = tmp_path / "broker.token"
+    token_file.write_text(BROKER_TOKEN, encoding="ascii")
+    token_file.chmod(0o600)
+    config = SudoApprovalConfig(
+        state_dir=tmp_path / "isolated-sudo-approval-state",
+        rp_id=RP_ID,
+        origin=ORIGIN,
+        ttl_seconds=90,
+        broker_id=BROKER_ID,
+        broker_token_file=token_file,
+    )
     instance = ApprovalVerifier(
-        SudoApprovalConfig(
-            state_dir=tmp_path / "isolated-sudo-approval-state",
-            rp_id=RP_ID,
-            origin=ORIGIN,
-            ttl_seconds=90,
-        ),
+        config,
         now=clock,
         random_bytes=DeterministicBytes(),
     )
     private_key = _private_key()
-    enrollment = instance.start_enrollment("Deterministic test credential")
+    enrollment = instance.start_enrollment("Deterministic credential")
     options = instance.enrollment_options(enrollment["token"])
     instance.finish_enrollment(
         enrollment["token"],
         _registration_payload(options["challenge"], private_key),
     )
-    return instance, clock, private_key
+    return instance, config, clock, private_key
 
 
-def _new_request(instance: ApprovalVerifier):
-    return instance.create_request(command=COMMAND, requester=REQUESTER)
+def _register(instance, clock, **changes):
+    transaction = _transaction(clock, **changes)
+    registration = instance.register_request(_envelope(transaction))
+    request_id, url_token = _url_capability(registration)
+    return transaction, registration, request_id, url_token
 
 
-def _approve(instance: ApprovalVerifier, private_key, request, *, flags: int = 0x05):
-    options = instance.approval_options(request["nonce"])
-    payload = _assertion_payload(options["challenge"], private_key, flags=flags)
-    return instance.approve(request["nonce"], payload), payload
-
-
-def test_challenge_is_exact_canonical_request_binding(verifier):
-    instance, _clock, _private_key = verifier
-    request = _new_request(instance)
-    binding = {
-        "purpose": "hermes-sudo-approval-v1",
-        "nonce": request["nonce"],
-        "command_sha256": request["command_sha256"],
-        "requester": request["requester"],
-        "expires_at": request["expires_at"],
-    }
-    expected = _b64u(
-        hashlib.sha256(
-            json.dumps(
-                binding,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode()
-        ).digest()
-    )
-    assert instance.approval_options(request["nonce"])["challenge"] == expected
-    assert instance.approval_options(request["nonce"])["userVerification"] == "required"
-
-
-def test_generic_signature_cannot_approve_exact_request(verifier):
-    instance, _clock, private_key = verifier
-    request = _new_request(instance)
-    generic_challenge = _b64u(hashlib.sha256(b"generic login challenge").digest())
-    generic_assertion = _assertion_payload(generic_challenge, private_key)
-
-    with pytest.raises(SudoApprovalError, match="exact sudo request"):
-        instance.approve(request["nonce"], generic_assertion)
-
-    assert instance.request_status(request["nonce"])["state"] == "pending"
-
-
-def test_consumer_rejects_changed_command_requester_and_expiry(verifier):
-    instance, _clock, private_key = verifier
-    request = _new_request(instance)
-    _approve(instance, private_key, request)
-
-    with pytest.raises(SudoApprovalUnauthorized, match="command"):
-        instance.consume_approval(
-            nonce=request["nonce"],
-            command=COMMAND + " --changed",
-            requester=REQUESTER,
-            expires_at=request["expires_at"],
-        )
-    with pytest.raises(SudoApprovalUnauthorized, match="requester"):
-        instance.consume_approval(
-            nonce=request["nonce"],
-            command=COMMAND,
-            requester=REQUESTER + ":mutated",
-            expires_at=request["expires_at"],
-        )
-    with pytest.raises(SudoApprovalUnauthorized, match="expiry"):
-        instance.consume_approval(
-            nonce=request["nonce"],
-            command=COMMAND,
-            requester=REQUESTER,
-            expires_at=request["expires_at"] + 1,
-        )
-
-    consumed = instance.consume_approval(
-        nonce=request["nonce"],
-        command=COMMAND,
-        requester=REQUESTER,
-        expires_at=request["expires_at"],
-    )
-    assert consumed["state"] == "consumed"
-
-
-def test_assertion_replay_and_consumption_replay_are_rejected(verifier):
-    instance, _clock, private_key = verifier
-    request = _new_request(instance)
-    _approved, assertion = _approve(instance, private_key, request)
-
-    with pytest.raises(SudoApprovalConflict, match="already decided"):
-        instance.approve(request["nonce"], assertion)
-
-    instance.consume_approval(
-        nonce=request["nonce"],
-        command=COMMAND,
-        requester=REQUESTER,
-        expires_at=request["expires_at"],
-    )
-    with pytest.raises(SudoApprovalConflict, match="not consumable"):
-        instance.consume_approval(
-            nonce=request["nonce"],
-            command=COMMAND,
-            requester=REQUESTER,
-            expires_at=request["expires_at"],
-        )
-
-
-def test_expired_nonce_rejects_options_and_assertion(verifier):
-    instance, clock, private_key = verifier
-    request = _new_request(instance)
-    challenge = instance.approval_options(request["nonce"])["challenge"]
-    assertion = _assertion_payload(challenge, private_key)
-    clock.advance(91)
-
-    with pytest.raises(SudoApprovalExpired):
-        instance.approval_options(request["nonce"])
-    with pytest.raises(SudoApprovalExpired):
-        instance.approve(request["nonce"], assertion)
-    assert instance.request_status(request["nonce"])["state"] == "expired"
-
-
-def test_approved_request_cannot_be_consumed_after_expiry(verifier):
-    instance, clock, private_key = verifier
-    request = _new_request(instance)
-    _approve(instance, private_key, request)
-    clock.advance(91)
-
-    with pytest.raises(SudoApprovalExpired):
-        instance.consume_approval(
-            nonce=request["nonce"],
-            command=COMMAND,
-            requester=REQUESTER,
-            expires_at=request["expires_at"],
-        )
-    assert instance.request_status(request["nonce"])["state"] == "expired"
-
-
-def test_wrong_credential_is_rejected_without_authorizing(verifier):
-    instance, _clock, wrong_private_key = verifier[0], verifier[1], _private_key(11)
-    request = _new_request(instance)
-    challenge = instance.approval_options(request["nonce"])["challenge"]
+def _approve(instance, private_key, request_id, url_token, *, flags=0x05, **kwargs):
+    options = instance.approval_options(request_id, url_token)
     assertion = _assertion_payload(
-        challenge,
-        wrong_private_key,
-        credential_id=b"not-enrolled",
+        options["challenge"],
+        private_key,
+        flags=flags,
+        **kwargs,
+    )
+    return instance.approve(request_id, url_token, assertion), assertion
+
+
+def test_challenge_is_the_exact_canonical_transaction_digest(verifier):
+    instance, _config, clock, _private_key = verifier
+    transaction, registration, request_id, url_token = _register(instance, clock)
+    digest = hashlib.sha256(_canonical_json(transaction)).hexdigest()
+    expected_challenge = _b64u(bytes.fromhex(digest))
+
+    options = instance.approval_options(request_id, url_token)
+    assert registration["request_digest"] == digest
+    assert options["challenge"] == expected_challenge
+    assert options["userVerification"] == "required"
+
+
+def test_shared_protocol_v1_golden_digest():
+    assert (
+        _request_digest(_transaction(Clock()))
+        == "1770d92cb05b17e657533734c1cfd81b2a1800a9b890d3ed12ff72fd42420f23"
     )
 
-    with pytest.raises(SudoApprovalUnauthorized, match="not authorized"):
-        instance.approve(request["nonce"], assertion)
-    assert instance.request_status(request["nonce"])["state"] == "pending"
+
+@pytest.mark.parametrize(
+    ("field", "mutation"),
+    [
+        ("command", {"argv": ["/usr/bin/false"], "command": "/usr/bin/false"}),
+        ("cwd", {"cwd": "/"}),
+        ("requester_uid", {"requester_uid": 1001}),
+        ("requester_worker_id", {"requester_worker_id": "paseo:worker-other"}),
+        ("broker_nonce", {"broker_nonce": "A" * 43}),
+        (
+            "request_id",
+            {"request_id": "22222222-2222-4222-8222-222222222222"},
+        ),
+        ("expiry", {"expires_at": 1_900_000_091}),
+    ],
+)
+def test_approval_a_cannot_consume_mutated_transaction_b(verifier, field, mutation):
+    instance, _config, clock, private_key = verifier
+    transaction, _registration, request_id, url_token = _register(instance, clock)
+    approved, _assertion = _approve(instance, private_key, request_id, url_token)
+    changed = copy.deepcopy(transaction)
+    changed.update(mutation)
+
+    with pytest.raises((SudoApprovalError, SudoApprovalUnauthorized)):
+        instance.consume_approval(
+            request_id=request_id,
+            request=changed,
+            request_digest=_request_digest(changed),
+            decision_id=approved["decision_id"],
+        )
+    assert instance.decision_status(request_id)["status"] == "approved"
 
 
-def test_missing_uv_flag_is_rejected_even_with_valid_signature(verifier):
-    instance, _clock, private_key = verifier
-    request = _new_request(instance)
-    challenge = instance.approval_options(request["nonce"])["challenge"]
-    assertion = _assertion_payload(challenge, private_key, flags=0x01)
+def test_approval_a_rejects_digest_and_decision_id_mutation(verifier):
+    instance, _config, clock, private_key = verifier
+    transaction, _registration, request_id, url_token = _register(instance, clock)
+    approved, _assertion = _approve(instance, private_key, request_id, url_token)
 
-    with pytest.raises(SudoApprovalError, match="user verification"):
-        instance.approve(request["nonce"], assertion)
-    assert instance.request_status(request["nonce"])["state"] == "pending"
-
-
-def test_duplicate_approve_and_deny_transitions_are_terminal(verifier):
-    instance, _clock, private_key = verifier
-    approved_request = _new_request(instance)
-    _approved, assertion = _approve(instance, private_key, approved_request)
-
-    with pytest.raises(SudoApprovalConflict):
-        instance.deny(approved_request["nonce"])
-    with pytest.raises(SudoApprovalConflict):
-        instance.approve(approved_request["nonce"], assertion)
-
-    denied_request = _new_request(instance)
-    challenge = instance.approval_options(denied_request["nonce"])["challenge"]
-    denied_assertion = _assertion_payload(challenge, private_key, sign_count=2)
-    assert instance.deny(denied_request["nonce"])["state"] == "denied"
-    with pytest.raises(SudoApprovalConflict):
-        instance.deny(denied_request["nonce"])
-    with pytest.raises(SudoApprovalConflict):
-        instance.approve(denied_request["nonce"], denied_assertion)
-
-    events = instance.audit_events()
-    denied_events = [
-        event
-        for event in events
-        if event.get("event") == "denied"
-        and event.get("nonce") == denied_request["nonce"]
-    ]
-    assert len(denied_events) == 1
-    assert all("command" not in event for event in events)
-
-
-def test_unauthorized_enrollment_and_reuse_are_rejected(tmp_path):
-    instance = ApprovalVerifier(
-        SudoApprovalConfig(tmp_path / "state", RP_ID, ORIGIN, 90),
-        now=Clock(),
-        random_bytes=DeterministicBytes(),
-    )
-    with pytest.raises(SudoApprovalUnauthorized):
-        instance.enrollment_options("untrusted-token")
-    with pytest.raises(SudoApprovalUnauthorized):
-        instance.enrollment_status("untrusted-token")
-
-    enrollment = instance.start_enrollment("Trusted enrollment")
-    options = instance.enrollment_options(enrollment["token"])
-    instance.finish_enrollment(
-        enrollment["token"],
-        _registration_payload(options["challenge"], _private_key()),
-    )
-    with pytest.raises(SudoApprovalUnauthorized, match="already used"):
-        instance.finish_enrollment(
-            enrollment["token"],
-            _registration_payload(options["challenge"], _private_key()),
+    with pytest.raises(SudoApprovalUnauthorized, match="digest"):
+        instance.consume_approval(
+            request_id=request_id,
+            request=transaction,
+            request_digest="0" * 64,
+            decision_id=approved["decision_id"],
+        )
+    with pytest.raises(SudoApprovalUnauthorized, match="decision_id"):
+        instance.consume_approval(
+            request_id=request_id,
+            request=transaction,
+            request_digest=_request_digest(transaction),
+            decision_id="33333333-3333-4333-8333-333333333333",
         )
 
 
-def test_enrollment_requires_uv_and_spends_failed_one_time_link(tmp_path):
+def test_replay_rejected_across_verifier_restarts(verifier):
+    instance, config, clock, private_key = verifier
+    transaction, _registration, request_id, url_token = _register(instance, clock)
+    approved, assertion = _approve(instance, private_key, request_id, url_token)
+
+    restarted = ApprovalVerifier(config, now=clock, random_bytes=DeterministicBytes())
+    with pytest.raises(SudoApprovalConflict, match="already decided"):
+        restarted.approve(request_id, url_token, assertion)
+    consumed = restarted.consume_approval(
+        request_id=request_id,
+        request=transaction,
+        request_digest=_request_digest(transaction),
+        decision_id=approved["decision_id"],
+    )
+    assert consumed["status"] == "consumed"
+
+    restarted_again = ApprovalVerifier(config, now=clock)
+    assert restarted_again.decision_status(request_id)["status"] == "consumed"
+    with pytest.raises(SudoApprovalConflict, match="not consumable"):
+        restarted_again.consume_approval(
+            request_id=request_id,
+            request=transaction,
+            request_digest=_request_digest(transaction),
+            decision_id=approved["decision_id"],
+        )
+
+
+def test_pending_and_approved_unconsumed_requests_expire_after_restart(verifier):
+    instance, config, clock, private_key = verifier
+    _pending_tx, _registration, pending_id, pending_token = _register(instance, clock)
+    second_id = "22222222-2222-4222-8222-222222222222"
+    approved_tx, _registration, approved_id, approved_token = _register(
+        instance,
+        clock,
+        request_id=second_id,
+        broker_nonce="B" * 43,
+    )
+    approved, _assertion = _approve(
+        instance,
+        private_key,
+        approved_id,
+        approved_token,
+    )
+    clock.advance(90)
+
+    restarted = ApprovalVerifier(config, now=clock)
+    assert restarted.decision_status(pending_id)["status"] == "expired"
+    assert restarted.decision_status(approved_id)["status"] == "expired"
+    with pytest.raises(SudoApprovalExpired):
+        restarted.approval_options(pending_id, pending_token)
+    with pytest.raises(SudoApprovalExpired):
+        restarted.consume_approval(
+            request_id=approved_id,
+            request=approved_tx,
+            request_digest=_request_digest(approved_tx),
+            decision_id=approved["decision_id"],
+        )
+
+
+def test_missing_uv_wrong_credential_origin_and_rp_fail_closed(verifier):
+    instance, _config, clock, private_key = verifier
+    cases = [
+        {"flags": 0x01},
+        {"credential_id": b"not-enrolled"},
+        {"origin": "https://wrong.example.test"},
+        {"rp_id": "wrong.example.test"},
+    ]
+    for index, case in enumerate(cases, start=1):
+        request_id = f"{index + 1:08d}-1111-4111-8111-111111111111"
+        _transaction_value, _registration, rid, token = _register(
+            instance,
+            clock,
+            request_id=request_id,
+            broker_nonce=_b64u(hashlib.sha256(str(index).encode()).digest()),
+        )
+        options = instance.approval_options(rid, token)
+        assertion = _assertion_payload(options["challenge"], private_key, **case)
+        with pytest.raises(SudoApprovalError):
+            instance.approve(rid, token, assertion)
+        assert instance.decision_status(rid)["status"] == "pending"
+
+
+def test_deny_is_terminal_and_url_token_has_no_approval_authority(verifier):
+    instance, _config, clock, private_key = verifier
+    _transaction_value, _registration, request_id, url_token = _register(instance, clock)
+    wrong_token = "Z" * 43
+    with pytest.raises(SudoApprovalUnauthorized, match="link"):
+        instance.request_status(request_id, wrong_token)
+    with pytest.raises(SudoApprovalUnauthorized, match="link"):
+        instance.deny(request_id, wrong_token)
+
+    assert instance.deny(request_id, url_token)["state"] == "denied"
+    with pytest.raises(SudoApprovalConflict):
+        instance.deny(request_id, url_token)
+    options_challenge = _b64u(bytes.fromhex(_request_digest(_transaction(clock))))
+    with pytest.raises(SudoApprovalConflict):
+        instance.approve(
+            request_id,
+            url_token,
+            _assertion_payload(options_challenge, private_key),
+        )
+
+
+def test_wrong_broker_identity_and_bearer_token_are_rejected(verifier):
+    instance, _config, clock, _private_key = verifier
+    wrong_identity = _transaction(clock, broker_id="other-desktop")
+    with pytest.raises(SudoApprovalUnauthorized, match="broker identity"):
+        instance.register_request(_envelope(wrong_identity))
+
+    good = _HeaderHandler(
+        {
+            "Host": "approval.example.test",
+            "Authorization": f"Bearer {BROKER_TOKEN}",
+        }
+    )
+    validate_broker_authorization(good, instance)
+    with pytest.raises(SudoApprovalUnauthorized, match="unauthorized"):
+        validate_broker_authorization(
+            _HeaderHandler(
+                {
+                    "Host": "approval.example.test",
+                    "Authorization": "Bearer wrong-broker-token-value-xxxxxxxx",
+                }
+            ),
+            instance,
+        )
+
+
+def test_state_is_private_durable_and_metadata_audit_omits_command(verifier):
+    instance, config, clock, _private_key = verifier
+    _register(instance, clock)
+    assert config.state_dir.stat().st_mode & 0o777 == 0o700
+    assert instance.state_file.stat().st_mode & 0o777 == 0o600
+    assert instance.lock_file.stat().st_mode & 0o777 == 0o600
+    assert COMMAND not in json.dumps(instance.audit_events())
+
+
+def test_enrollment_requires_uv_and_is_single_use(tmp_path):
+    clock = Clock()
     instance = ApprovalVerifier(
-        SudoApprovalConfig(tmp_path / "state", RP_ID, ORIGIN, 90),
-        now=Clock(),
+        SudoApprovalConfig(tmp_path / "state", RP_ID, ORIGIN, 90, BROKER_ID),
+        now=clock,
         random_bytes=DeterministicBytes(),
     )
     enrollment = instance.start_enrollment("No UV")
@@ -422,61 +482,37 @@ def test_enrollment_requires_uv_and_spends_failed_one_time_link(tmp_path):
         instance.enrollment_options(enrollment["token"])
 
 
-def test_state_is_private_and_separate(tmp_path, verifier):
-    instance, _clock, _private_key = verifier
-    _new_request(instance)
-    assert instance.config.state_dir == tmp_path / "isolated-sudo-approval-state"
-    assert instance.config.state_dir.stat().st_mode & 0o777 == 0o700
-    assert instance.state_file.stat().st_mode & 0o777 == 0o600
-    assert instance.lock_file.stat().st_mode & 0o777 == 0o600
-
-
 @pytest.mark.parametrize("ttl", [59, 121])
-def test_ttl_outside_approved_window_fails_closed(tmp_path, ttl):
+def test_ttl_outside_protocol_window_fails_closed(tmp_path, ttl):
     with pytest.raises(SudoApprovalConfigError, match="between 60 and 120"):
         ApprovalVerifier(SudoApprovalConfig(tmp_path / "state", RP_ID, ORIGIN, ttl))
 
 
-def test_sessionless_ui_has_no_login_or_remote_admin_surface():
-    root = Path(__file__).resolve().parent.parent
-    html = (root / "static" / "sudo-approval.html").read_text(encoding="utf-8")
-    js = (root / "static" / "sudo-approval.js").read_text(encoding="utf-8")
-    routes = (root / "api" / "sudo_approval_routes.py").read_text(encoding="utf-8")
-    docs = (root / "docs" / "sudo-approval.md").read_text(encoding="utf-8")
-
-    assert "Exact command" in html
-    assert "Requester" in html
-    assert "Expires" in html
-    assert "Approve with passkey" in html
-    assert "Deny" in html
-    assert "userVerification" not in html
-    assert "credentials: 'omit'" in js
-    assert "login" not in js.lower()
-    assert "otp" not in js.lower()
-    assert "/api/sudo-approval/create" not in routes
-    assert "/api/sudo-approval/consume" not in routes
-    assert "Cloudflare Access application" in docs
-
-
-def test_no_live_or_broad_state_environment_is_used(verifier, monkeypatch):
-    instance, _clock, _private_key = verifier
-    monkeypatch.setenv("HERMES_WEBUI_STATE_DIR", "/definitely/not/the/verifier")
-    request = _new_request(instance)
-    assert request["state"] == "pending"
-    assert "/definitely/not/the/verifier" not in str(instance.state_file)
-    state = json.loads(instance.state_file.read_text(encoding="utf-8"))
-    assert state["requests"][request["nonce"]]["purpose"] == "hermes-sudo-approval-v1"
-    assert not (Path(os.environ["HERMES_WEBUI_STATE_DIR"]) / "state.json").exists()
-
-
-class _RouteHandler:
+class _HeaderHandler:
     def __init__(self, headers):
         self.headers = headers
 
 
+class _ResponseHandler(_HeaderHandler):
+    def __init__(self, headers):
+        super().__init__(headers)
+        self.status = None
+        self.response_headers = {}
+        self.wfile = io.BytesIO()
+
+    def send_response(self, status):
+        self.status = status
+
+    def send_header(self, name, value):
+        self.response_headers[name] = value
+
+    def end_headers(self):
+        return None
+
+
 def test_narrow_route_requires_exact_host_and_browser_origin(verifier):
-    instance, _clock, _private_key = verifier
-    valid = _RouteHandler(
+    instance, _config, _clock, _private_key = verifier
+    valid = _HeaderHandler(
         {
             "Host": "approval.example.test",
             "Origin": ORIGIN,
@@ -485,57 +521,81 @@ def test_narrow_route_requires_exact_host_and_browser_origin(verifier):
     )
     validate_request_host(valid, instance)
     validate_browser_origin(valid, instance)
-
-    with pytest.raises(SudoApprovalUnauthorized, match="configured origin"):
-        validate_request_host(
-            _RouteHandler({"Host": "webui.example.test"}),
-            instance,
-        )
-    with pytest.raises(SudoApprovalUnauthorized, match="origin mismatch"):
+    with pytest.raises(SudoApprovalUnauthorized):
+        validate_request_host(_HeaderHandler({"Host": "webui.example.test"}), instance)
+    with pytest.raises(SudoApprovalUnauthorized):
         validate_browser_origin(
-            _RouteHandler(
+            _HeaderHandler(
                 {
                     "Host": "approval.example.test",
-                    "Origin": "https://webui.example.test",
+                    "Origin": "https://wrong.example.test",
                     "Sec-Fetch-Site": "cross-site",
                 }
             ),
             instance,
         )
-    with pytest.raises(SudoApprovalUnauthorized, match="origin mismatch"):
-        validate_browser_origin(
-            _RouteHandler({"Host": "approval.example.test"}),
-            instance,
-        )
 
 
-def test_only_narrow_sessionless_routes_bypass_webui_session(monkeypatch):
+def test_sessionless_ui_and_broker_api_never_use_login_or_otp():
+    root = Path(__file__).resolve().parent.parent
+    html = (root / "static" / "sudo-approval.html").read_text(encoding="utf-8")
+    js = (root / "static" / "sudo-approval.js").read_text(encoding="utf-8")
+    routes = (root / "api" / "sudo_approval_routes.py").read_text(encoding="utf-8")
+    assert "Exact command" in html
+    assert "Working directory" in html
+    assert "Approve with passkey" in html
+    assert "credentials: 'omit'" in js
+    assert "login" not in js.lower()
+    assert "otp" not in js.lower()
+    assert "validate_broker_authorization" in routes
+
+
+def test_only_exact_sessionless_paths_bypass_webui_session(monkeypatch):
     import api.auth as auth
 
-    assert auth._is_public_sudo_approval_path("/api/sudo-approval/options")
     assert auth._is_public_sudo_approval_path(
-        "/api/sudo-approval/requests/abcdefghijklmnopqrstuvwxyz123456"
+        f"/api/sudo-approval/requests/{REQUEST_ID}/{BROKER_NONCE}"
     )
-    assert not auth._is_public_sudo_approval_path("/api/sudo-approval/create")
-    assert not auth._is_public_sudo_approval_path("/api/sudo-approval/consume")
-
+    assert auth._is_public_sudo_approval_path(
+        "/api/sudo-approval/broker/v1/requests"
+    )
+    assert not auth._is_public_sudo_approval_path(
+        "/api/sudo-approval/broker/v1/admin"
+    )
+    assert not auth._is_public_sudo_approval_path("/api/sudo-approval/admin")
     monkeypatch.setattr(auth, "is_auth_enabled", lambda: True)
-    handler = object()
     assert auth.check_auth(
-        handler,
-        urlparse("/sudo-approval/abcdefghijklmnopqrstuvwxyz123456"),
-    )
-    assert auth.check_auth(
-        handler,
-        urlparse("/sudo-enrollment/abcdefghijklmnopqrstuvwxyz123456"),
-    )
-    assert auth.check_auth(
-        handler,
-        urlparse("/api/sudo-approval/options"),
+        object(),
+        urlparse(f"/sudo-approval/{REQUEST_ID}/{BROKER_NONCE}"),
     )
 
 
-def test_environment_config_rejects_broad_webui_state_child(monkeypatch):
+def test_no_access_approval_hostname_cannot_expose_broad_webui(monkeypatch):
+    import api.auth as auth
+
+    monkeypatch.setenv("HERMES_WEBUI_SUDO_APPROVAL_ORIGIN", ORIGIN)
+    monkeypatch.setattr(auth, "is_auth_enabled", lambda: False)
+    blocked = _ResponseHandler({"Host": "approval.example.test"})
+    assert not auth.check_auth(blocked, urlparse("/api/sessions"))
+    assert blocked.status == 404
+    assert blocked.wfile.getvalue() == b'{"error":"Not found"}'
+
+    approval = _ResponseHandler({"Host": "approval.example.test"})
+    assert auth.check_auth(
+        approval,
+        urlparse(f"/sudo-approval/{REQUEST_ID}/{BROKER_NONCE}"),
+    )
+    static = _ResponseHandler({"Host": "approval.example.test"})
+    assert auth.check_auth(static, urlparse("/static/sudo-approval.js"))
+
+    ordinary_host = _ResponseHandler({"Host": "webui.example.test"})
+    assert auth.check_auth(ordinary_host, urlparse("/api/sessions"))
+
+
+def test_environment_config_requires_separate_state_and_broker_identity(
+    monkeypatch,
+    tmp_path,
+):
     from api.config import STATE_DIR
 
     monkeypatch.setenv("HERMES_WEBUI_SUDO_APPROVAL_ENABLED", "1")
@@ -545,5 +605,10 @@ def test_environment_config_rejects_broad_webui_state_child(monkeypatch):
     )
     monkeypatch.setenv("HERMES_WEBUI_SUDO_APPROVAL_RP_ID", RP_ID)
     monkeypatch.setenv("HERMES_WEBUI_SUDO_APPROVAL_ORIGIN", ORIGIN)
+    monkeypatch.setenv("HERMES_WEBUI_SUDO_APPROVAL_BROKER_ID", BROKER_ID)
+    monkeypatch.setenv(
+        "HERMES_WEBUI_SUDO_APPROVAL_BROKER_TOKEN_FILE",
+        str(tmp_path / "broker.token"),
+    )
     with pytest.raises(SudoApprovalConfigError, match="broad WebUI state"):
         config_from_env()

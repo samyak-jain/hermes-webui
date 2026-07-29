@@ -37,6 +37,10 @@
             <dd><pre id="requestCommand"></pre></dd>
           </div>
           <div class="ledger-row">
+            <dt>Working directory</dt>
+            <dd><code id="requestCwd"></code></dd>
+          </div>
+          <div class="ledger-row">
             <dt>Requester</dt>
             <dd id="requester"></dd>
           </div>
@@ -45,13 +49,18 @@
             <dd><time id="expiry"></time><span class="countdown" id="countdown"></span></dd>
           </div>
           <div class="ledger-row hash-row">
-            <dt>Command SHA-256</dt>
-            <dd><code id="commandHash"></code></dd>
+            <dt>Request ID</dt>
+            <dd><code id="requestId"></code></dd>
+          </div>
+          <div class="ledger-row hash-row">
+            <dt>Transaction SHA-256</dt>
+            <dd><code id="requestDigest"></code></dd>
           </div>
         </dl>
         <p class="binding-note">
           Your authenticator will verify this request with user verification.
-          The assertion cannot authorize a changed command, requester, or expiry.
+          The assertion cannot authorize changed argv, cwd, requester, broker
+          nonce, request ID, digest, or expiry.
         </p>
         <div class="action-row">
           <button class="button deny" id="denyButton" type="button">Deny</button>

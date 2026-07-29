@@ -46,9 +46,17 @@
   }
 
   function routeCapability() {
-    const match = location.pathname.match(/^\/(sudo-approval|sudo-enrollment)\/([A-Za-z0-9_-]{20,128})$/);
-    if (!match) return null;
-    return { kind: match[1] === 'sudo-approval' ? 'approval' : 'enrollment', value: match[2] };
+    const approval = location.pathname.match(/^\/sudo-approval\/([0-9a-f-]{36})\/([A-Za-z0-9_-]{43})$/);
+    if (approval) {
+      return {
+        kind: 'approval',
+        requestId: approval[1],
+        urlToken: approval[2],
+      };
+    }
+    const enrollment = location.pathname.match(/^\/sudo-enrollment\/([A-Za-z0-9_-]{20,128})$/);
+    if (enrollment) return { kind: 'enrollment', value: enrollment[1] };
+    return null;
   }
 
   function setBusy(button, busy) {
@@ -83,6 +91,16 @@
     const bytes = new TextEncoder().encode(text);
     const digest = await crypto.subtle.digest('SHA-256', bytes);
     return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  function canonicalJson(value) {
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+    if (value && typeof value === 'object') {
+      return `{${Object.keys(value).sort().map((key) => (
+        `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+      )).join(',')}}`;
+    }
+    return JSON.stringify(value);
   }
 
   function startCountdown(expiresAt) {
@@ -120,12 +138,32 @@
     return publicKey;
   }
 
-  async function loadApproval(nonce) {
-    const payload = await api(`/api/sudo-approval/requests/${encodeURIComponent(nonce)}`);
+  async function loadApproval(requestId, urlToken) {
+    const payload = await api(
+      `/api/sudo-approval/requests/${encodeURIComponent(requestId)}/${encodeURIComponent(urlToken)}`,
+    );
     const request = payload.request;
-    if (!request || typeof request.command !== 'string') throw new Error('Malformed approval request');
-    const displayedHash = await sha256Hex(request.command);
-    if (displayedHash !== request.command_sha256) throw new Error('Command hash verification failed');
+    if (!request || typeof request.command !== 'string' || !Array.isArray(request.argv)) {
+      throw new Error('Malformed approval request');
+    }
+    const transaction = {
+      protocol_version: request.protocol_version,
+      purpose: request.purpose,
+      request_id: request.request_id,
+      argv: request.argv,
+      command: request.command,
+      cwd: request.cwd,
+      requester_uid: request.requester_uid,
+      requester_worker_id: request.requester_worker_id,
+      broker_id: request.broker_id,
+      broker_nonce: request.broker_nonce,
+      created_at: request.created_at,
+      expires_at: request.expires_at,
+    };
+    const displayedHash = await sha256Hex(canonicalJson(transaction));
+    if (displayedHash !== request.request_digest) {
+      throw new Error('Transaction digest verification failed');
+    }
     if (request.state !== 'pending') {
       const terminalCopy = {
         approved: ['Approved', 'This request has been approved and is waiting for its exact local consumer.'],
@@ -138,8 +176,10 @@
     }
 
     $('requestCommand').textContent = request.command;
-    $('requester').textContent = request.requester;
-    $('commandHash').textContent = request.command_sha256;
+    $('requestCwd').textContent = request.cwd;
+    $('requester').textContent = `${request.requester_worker_id} · uid ${request.requester_uid}`;
+    $('requestId').textContent = request.request_id;
+    $('requestDigest').textContent = request.request_digest;
     const expiry = new Date(request.expires_at * 1000);
     $('expiry').dateTime = expiry.toISOString();
     $('expiry').textContent = expiry.toLocaleString();
@@ -157,13 +197,17 @@
         if (!window.PublicKeyCredential || !navigator.credentials) {
           throw new Error('This browser does not support WebAuthn in the current context.');
         }
-        const options = await api('/api/sudo-approval/options', { nonce });
+        const options = await api('/api/sudo-approval/options', {
+          request_id: requestId,
+          url_token: urlToken,
+        });
         const credential = await navigator.credentials.get({
           publicKey: normalizeAssertionOptions(options.publicKey),
         });
         if (!credential) throw new Error('Approval was cancelled.');
         await api('/api/sudo-approval/approve', {
-          nonce,
+          request_id: requestId,
+          url_token: urlToken,
           id: credential.id,
           rawId: bytesToB64u(credential.rawId),
           type: credential.type,
@@ -189,7 +233,10 @@
       setBusy($('denyButton'), true);
       $('approveButton').disabled = true;
       try {
-        await api('/api/sudo-approval/deny', { nonce });
+        await api('/api/sudo-approval/deny', {
+          request_id: requestId,
+          url_token: urlToken,
+        });
         showTerminal('denied', 'Denied', 'Denial recorded. No sudo authorization was issued.');
       } catch (error) {
         showError(error.message || 'Denial failed');
@@ -247,7 +294,9 @@
       return;
     }
     try {
-      if (route.kind === 'approval') await loadApproval(route.value);
+      if (route.kind === 'approval') {
+        await loadApproval(route.requestId, route.urlToken);
+      }
       else await loadEnrollment(route.value);
     } catch (error) {
       showTerminal(

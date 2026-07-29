@@ -58,7 +58,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       __init__.py          Package marker
       auth.py              Optional password authentication, signed cookies, passkeys/WebAuthn
       sudo_approvals.py    Isolated request-bound UV WebAuthn state machine for sudo
-      sudo_approval_routes.py Sessionless browser adapters; no create/consume admin API
+      sudo_approval_routes.py Sessionless browser + bearer-authenticated broker API
       config.py            Discovery, globals, model detection, reloadable config
       helpers.py           HTTP helpers: j(), bad(), require(), safe_resolve(), security headers
       models.py            Session model + CRUD, per-session profile tracking, CLI/state.db bridge

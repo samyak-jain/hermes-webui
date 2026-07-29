@@ -17,10 +17,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
+import shlex
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,7 +44,7 @@ except Exception:  # pragma: no cover - surfaced as a configuration error.
     hashes = serialization = ec = None  # type: ignore[assignment]
 
 
-_PURPOSE = "hermes-sudo-approval-v1"
+_PURPOSE = "sudo-approval/v1"
 _ENROLLMENT_PURPOSE = "hermes-sudo-approval-enrollment-v1"
 _STATE_VERSION = 1
 _DEFAULT_TTL_SECONDS = 90
@@ -50,10 +53,19 @@ _MAX_TTL_SECONDS = 120
 _ENROLLMENT_TTL_SECONDS = 300
 _MAX_COMMAND_BYTES = 64 * 1024
 _MAX_REQUESTER_BYTES = 512
+_MAX_ARGV_ITEMS = 256
+_MAX_ARG_BYTES = 32 * 1024
+_MAX_CWD_BYTES = 4096
+_MAX_BROKER_ID_BYTES = 128
 _MAX_RECORDS = 512
 _TERMINAL_RETENTION_SECONDS = 24 * 60 * 60
 _MAX_AUDIT_EVENTS = 2048
 _THREAD_LOCK = threading.RLock()
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$")
 
 
 class SudoApprovalError(ValueError):
@@ -82,6 +94,8 @@ class SudoApprovalConfig:
     rp_id: str
     origin: str
     ttl_seconds: int = _DEFAULT_TTL_SECONDS
+    broker_id: str = "samyak-desktop"
+    broker_token_file: Path | None = None
 
 
 def _truthy(value: str | None) -> bool:
@@ -124,11 +138,25 @@ def _validate_config(config: SudoApprovalConfig) -> SudoApprovalConfig:
     if not (_MIN_TTL_SECONDS <= int(config.ttl_seconds) <= _MAX_TTL_SECONDS):
         raise SudoApprovalConfigError("sudo approval TTL must be between 60 and 120 seconds")
     state_dir = Path(config.state_dir).expanduser().resolve()
+    broker_id = str(config.broker_id or "").strip()
+    if (
+        not broker_id
+        or len(broker_id.encode("utf-8")) > _MAX_BROKER_ID_BYTES
+        or not _IDENTITY_RE.fullmatch(broker_id)
+    ):
+        raise SudoApprovalConfigError("sudo approval broker identity is invalid")
+    token_file = (
+        Path(config.broker_token_file).expanduser().resolve()
+        if config.broker_token_file is not None
+        else None
+    )
     return SudoApprovalConfig(
         state_dir=state_dir,
         rp_id=rp_id,
         origin=str(config.origin).strip().rstrip("/"),
         ttl_seconds=int(config.ttl_seconds),
+        broker_id=broker_id,
+        broker_token_file=token_file,
     )
 
 
@@ -139,16 +167,29 @@ def config_from_env() -> SudoApprovalConfig:
     state_dir = os.getenv("HERMES_WEBUI_SUDO_APPROVAL_STATE_DIR", "").strip()
     rp_id = os.getenv("HERMES_WEBUI_SUDO_APPROVAL_RP_ID", "").strip()
     origin = os.getenv("HERMES_WEBUI_SUDO_APPROVAL_ORIGIN", "").strip()
-    if not state_dir or not rp_id or not origin:
+    broker_id = os.getenv("HERMES_WEBUI_SUDO_APPROVAL_BROKER_ID", "").strip()
+    broker_token_file = os.getenv(
+        "HERMES_WEBUI_SUDO_APPROVAL_BROKER_TOKEN_FILE", ""
+    ).strip()
+    if not state_dir or not rp_id or not origin or not broker_id or not broker_token_file:
         raise SudoApprovalConfigError(
-            "sudo approval requires an explicit state directory, RP ID, and origin"
+            "sudo approval requires state, RP/origin, broker identity, and broker token file"
         )
     ttl_raw = os.getenv("HERMES_WEBUI_SUDO_APPROVAL_TTL_SECONDS", "").strip()
     try:
         ttl = int(ttl_raw) if ttl_raw else _DEFAULT_TTL_SECONDS
     except ValueError as exc:
         raise SudoApprovalConfigError("sudo approval TTL must be an integer") from exc
-    config = _validate_config(SudoApprovalConfig(Path(state_dir), rp_id, origin, ttl))
+    config = _validate_config(
+        SudoApprovalConfig(
+            Path(state_dir),
+            rp_id,
+            origin,
+            ttl,
+            broker_id,
+            Path(broker_token_file),
+        )
+    )
     from api.config import STATE_DIR
 
     broad_state_dir = STATE_DIR.resolve()
@@ -288,18 +329,131 @@ def _command_hash(command: str) -> str:
     return hashlib.sha256(command.encode("utf-8")).hexdigest()
 
 
-def _request_binding(
+def _request_digest(request: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(request)).hexdigest()
+
+
+def _canonical_uuid(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not _UUID_RE.fullmatch(value):
+        raise SudoApprovalError(f"{field} is not a canonical UUID")
+    try:
+        if str(uuid.UUID(value)) != value:
+            raise ValueError
+    except ValueError as exc:
+        raise SudoApprovalError(f"{field} is not a canonical UUID") from exc
+    return value
+
+
+def _validate_digest(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise SudoApprovalError("request_digest is not lowercase SHA-256")
+    return value
+
+
+def _validate_exact_transaction(
+    value: Any,
     *,
-    nonce: str,
-    command_sha256: str,
-    requester: str,
-    expires_at: int,
+    broker_id: str,
+    now: int,
 ) -> dict[str, Any]:
+    expected = {
+        "protocol_version",
+        "purpose",
+        "request_id",
+        "argv",
+        "command",
+        "cwd",
+        "requester_uid",
+        "requester_worker_id",
+        "broker_id",
+        "broker_nonce",
+        "created_at",
+        "expires_at",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise SudoApprovalError("transaction fields do not match protocol v1")
+    if value["protocol_version"] != 1 or value["purpose"] != _PURPOSE:
+        raise SudoApprovalError("transaction purpose or protocol is unsupported")
+    request_id = _canonical_uuid(value["request_id"], field="request_id")
+    argv_value = value["argv"]
+    if (
+        not isinstance(argv_value, list)
+        or not argv_value
+        or len(argv_value) > _MAX_ARGV_ITEMS
+    ):
+        raise SudoApprovalError("argv must be a non-empty bounded array")
+    argv: list[str] = []
+    total = 0
+    for item in argv_value:
+        if not isinstance(item, str) or not item or "\x00" in item:
+            raise SudoApprovalError("argv contains an invalid item")
+        encoded = item.encode("utf-8")
+        total += len(encoded)
+        if len(encoded) > _MAX_ARG_BYTES or total > _MAX_ARG_BYTES:
+            raise SudoApprovalError("argv is too large")
+        argv.append(item)
+    if not os.path.isabs(argv[0]):
+        raise SudoApprovalError("argv[0] must be absolute")
+    command = value["command"]
+    if not isinstance(command, str) or command != shlex.join(argv):
+        raise SudoApprovalError("command is not the canonical argv serialization")
+    cwd = value["cwd"]
+    if (
+        not isinstance(cwd, str)
+        or not os.path.isabs(cwd)
+        or "\x00" in cwd
+        or len(cwd.encode("utf-8")) > _MAX_CWD_BYTES
+        or os.path.normpath(cwd) != cwd
+    ):
+        raise SudoApprovalError("cwd must be a normalized absolute path")
+    requester_uid = value["requester_uid"]
+    if (
+        isinstance(requester_uid, bool)
+        or not isinstance(requester_uid, int)
+        or requester_uid < 0
+    ):
+        raise SudoApprovalError("requester_uid is invalid")
+    requester_worker_id = value["requester_worker_id"]
+    if (
+        not isinstance(requester_worker_id, str)
+        or len(requester_worker_id.encode("utf-8")) > _MAX_REQUESTER_BYTES
+        or not _IDENTITY_RE.fullmatch(requester_worker_id)
+    ):
+        raise SudoApprovalError("requester_worker_id is invalid")
+    if value["broker_id"] != broker_id:
+        raise SudoApprovalUnauthorized("broker identity does not match this verifier")
+    broker_nonce = value["broker_nonce"]
+    if not isinstance(broker_nonce, str) or not _NONCE_RE.fullmatch(broker_nonce):
+        raise SudoApprovalError("broker_nonce is not canonical base64url")
+    created_at = value["created_at"]
+    expires_at = value["expires_at"]
+    if (
+        isinstance(created_at, bool)
+        or not isinstance(created_at, int)
+        or isinstance(expires_at, bool)
+        or not isinstance(expires_at, int)
+        or expires_at - created_at < _MIN_TTL_SECONDS
+        or expires_at - created_at > _MAX_TTL_SECONDS
+        or created_at > now + 30
+        or expires_at <= now
+    ):
+        raise SudoApprovalExpired("transaction timestamps are invalid or expired")
     return {
+        "protocol_version": 1,
         "purpose": _PURPOSE,
-        "nonce": nonce,
-        "command_sha256": command_sha256,
-        "requester": requester,
+        "request_id": request_id,
+        "argv": argv,
+        "command": command,
+        "cwd": cwd,
+        "requester_uid": requester_uid,
+        "requester_worker_id": requester_worker_id,
+        "broker_id": broker_id,
+        "broker_nonce": broker_nonce,
+        "created_at": created_at,
         "expires_at": expires_at,
     }
 
@@ -426,12 +580,16 @@ class ApprovalVerifier:
     ) -> None:
         row: dict[str, Any] = {"at": int(self._now()), "event": event}
         if request:
+            transaction = request.get("transaction")
+            if not isinstance(transaction, dict):
+                transaction = request
             row.update(
                 {
-                    "nonce": request.get("nonce"),
-                    "command_sha256": request.get("command_sha256"),
-                    "requester": request.get("requester"),
-                    "expires_at": request.get("expires_at"),
+                    "request_id": transaction.get("request_id"),
+                    "request_digest": request.get("request_digest"),
+                    "requester_uid": transaction.get("requester_uid"),
+                    "requester_worker_id": transaction.get("requester_worker_id"),
+                    "expires_at": transaction.get("expires_at"),
                 }
             )
         if credential_id:
@@ -449,14 +607,19 @@ class ApprovalVerifier:
             if not isinstance(record, dict) or int(record.get("expires_at", 0)) <= now:
                 enrollments.pop(digest, None)
         requests = state.get("requests", {})
-        for nonce, request in list(requests.items()):
+        for request_id, request in list(requests.items()):
             if not isinstance(request, dict):
-                requests.pop(nonce, None)
+                requests.pop(request_id, None)
                 continue
-            expires_at = int(request.get("expires_at", 0))
+            transaction = request.get("transaction")
+            expires_at = (
+                int(transaction.get("expires_at", 0))
+                if isinstance(transaction, dict)
+                else 0
+            )
             if request.get("state") in {"pending", "approved"} and expires_at <= now:
                 request["state"] = "expired"
-                request["decided_at"] = now
+                request["decided_at"] = expires_at
                 self._audit(state, "expired", request=request)
             terminal_at = int(
                 request.get("consumed_at")
@@ -465,15 +628,17 @@ class ApprovalVerifier:
                 or 0
             )
             if request.get("state") != "pending" and terminal_at + _TERMINAL_RETENTION_SECONDS <= now:
-                requests.pop(nonce, None)
+                requests.pop(request_id, None)
         if len(requests) > _MAX_RECORDS:
             ordered = sorted(
                 requests,
-                key=lambda key: int(requests[key].get("created_at", 0)),
+                key=lambda key: int(
+                    (requests[key].get("transaction") or {}).get("created_at", 0)
+                ),
             )
-            for nonce in ordered[: len(requests) - _MAX_RECORDS]:
-                if requests[nonce].get("state") != "pending":
-                    requests.pop(nonce, None)
+            for request_id in ordered[: len(requests) - _MAX_RECORDS]:
+                if requests[request_id].get("state") != "pending":
+                    requests.pop(request_id, None)
 
     @staticmethod
     def _validate_command(command: Any) -> str:
@@ -693,73 +858,135 @@ class ApprovalVerifier:
             )
             return removed
 
-    def create_request(
-        self,
-        *,
-        command: str,
-        requester: str,
-        ttl_seconds: int | None = None,
-    ) -> dict[str, Any]:
-        command = self._validate_command(command)
-        requester = self._validate_requester(requester)
-        ttl = self.config.ttl_seconds if ttl_seconds is None else int(ttl_seconds)
-        if not (_MIN_TTL_SECONDS <= ttl <= _MAX_TTL_SECONDS):
-            raise SudoApprovalError("sudo approval TTL must be between 60 and 120 seconds")
-        nonce = _b64u(self._random_bytes(32))
+    def register_request(self, envelope: Any) -> dict[str, Any]:
+        if not isinstance(envelope, dict) or set(envelope) != {
+            "protocol_version",
+            "request",
+            "request_digest",
+        }:
+            raise SudoApprovalError("broker registration envelope is malformed")
+        if envelope["protocol_version"] != 1:
+            raise SudoApprovalError("unsupported broker protocol version")
         now = int(self._now())
-        expires_at = now + ttl
-        command_sha256 = _command_hash(command)
-        binding = _request_binding(
-            nonce=nonce,
-            command_sha256=command_sha256,
-            requester=requester,
-            expires_at=expires_at,
+        transaction = _validate_exact_transaction(
+            envelope["request"],
+            broker_id=self.config.broker_id,
+            now=now,
         )
+        digest = _validate_digest(envelope["request_digest"])
+        if not hmac.compare_digest(_request_digest(transaction), digest):
+            raise SudoApprovalUnauthorized("request digest does not match transaction")
+        request_id = transaction["request_id"]
+        url_token = _b64u(self._random_bytes(32))
         request = {
-            **binding,
-            "command": command,
-            "challenge": _binding_challenge(binding),
-            "created_at": now,
+            "transaction": transaction,
+            "request_digest": digest,
+            "url_token_sha256": hashlib.sha256(url_token.encode("ascii")).hexdigest(),
+            "challenge": _b64u(bytes.fromhex(digest)),
             "state": "pending",
         }
         with self._locked_state() as state:
             if not state["credentials"]:
                 raise SudoApprovalConflict("no sudo approval credential is enrolled")
-            state["requests"][nonce] = request
+            if request_id in state["requests"]:
+                raise SudoApprovalConflict("request_id was already registered")
+            if any(
+                isinstance(existing, dict)
+                and hmac.compare_digest(
+                    str(existing.get("request_digest") or ""),
+                    digest,
+                )
+                for existing in state["requests"].values()
+            ):
+                raise SudoApprovalConflict("request_digest was already registered")
+            state["requests"][request_id] = request
             self._audit(state, "request_created", request=request)
-        return self._public_request(request)
+        return {
+            "protocol_version": 1,
+            "request_id": request_id,
+            "request_digest": digest,
+            "broker_nonce": transaction["broker_nonce"],
+            "expires_at": transaction["expires_at"],
+            "approval_url": (
+                f"{self.config.origin}/sudo-approval/{request_id}/{url_token}"
+            ),
+        }
 
-    def _get_request(self, state: dict[str, Any], nonce: str) -> dict[str, Any]:
-        request = state["requests"].get(str(nonce))
+    def _get_request(self, state: dict[str, Any], request_id: str) -> dict[str, Any]:
+        request_id = _canonical_uuid(request_id, field="request_id")
+        request = state["requests"].get(request_id)
         if not isinstance(request, dict):
             raise SudoApprovalUnauthorized("approval request not found")
-        if request.get("state") in {"pending", "approved"} and int(
-            request.get("expires_at", 0)
-        ) <= int(self._now()):
+        transaction = request.get("transaction")
+        if not isinstance(transaction, dict):
+            raise SudoApprovalConfigError("stored approval transaction is malformed")
+        if (
+            request.get("state") in {"pending", "approved"}
+            and int(transaction.get("expires_at", 0)) <= int(self._now())
+        ):
             request["state"] = "expired"
-            request["decided_at"] = int(self._now())
+            request["decided_at"] = int(transaction["expires_at"])
             self._audit(state, "expired", request=request)
         return request
 
     @staticmethod
     def _public_request(request: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "nonce": request.get("nonce"),
-            "command": request.get("command"),
-            "command_sha256": request.get("command_sha256"),
-            "requester": request.get("requester"),
-            "created_at": request.get("created_at"),
-            "expires_at": request.get("expires_at"),
+        transaction = dict(request["transaction"])
+        result = {
+            **transaction,
+            "request_digest": request.get("request_digest"),
             "state": request.get("state"),
         }
+        for field in ("decision_id", "decided_at", "consumed_at"):
+            if field in request:
+                result[field] = request[field]
+        return result
 
-    def request_status(self, nonce: str) -> dict[str, Any]:
-        with self._locked_state() as state:
-            return self._public_request(self._get_request(state, nonce))
+    @staticmethod
+    def _validate_url_token(request: dict[str, Any], url_token: str) -> None:
+        if not isinstance(url_token, str) or not _NONCE_RE.fullmatch(url_token):
+            raise SudoApprovalUnauthorized("approval link is invalid")
+        supplied = hashlib.sha256(url_token.encode("ascii")).hexdigest()
+        expected = str(request.get("url_token_sha256") or "")
+        if not expected or not hmac.compare_digest(supplied, expected):
+            raise SudoApprovalUnauthorized("approval link is invalid")
 
-    def approval_options(self, nonce: str) -> dict[str, Any]:
+    def request_status(self, request_id: str, url_token: str) -> dict[str, Any]:
         with self._locked_state() as state:
-            request = self._get_request(state, nonce)
+            request = self._get_request(state, request_id)
+            self._validate_url_token(request, url_token)
+            return self._public_request(request)
+
+    def decision_status(self, request_id: str) -> dict[str, Any]:
+        with self._locked_state() as state:
+            request = self._get_request(state, request_id)
+            transaction = request["transaction"]
+            status = str(request["state"])
+            result: dict[str, Any] = {
+                "protocol_version": 1,
+                "request_id": transaction["request_id"],
+                "request_digest": request["request_digest"],
+                "broker_nonce": transaction["broker_nonce"],
+                "expires_at": transaction["expires_at"],
+                "status": status,
+            }
+            if status in {"approved", "denied", "consumed"}:
+                result["decision_id"] = request["decision_id"]
+                result["decided_at"] = request["decided_at"]
+            elif status == "expired":
+                result["decided_at"] = request["decided_at"]
+            if status == "consumed":
+                result["consumed_at"] = request["consumed_at"]
+            return result
+
+    def approval_options(
+        self,
+        request_id: str,
+        url_token: str,
+    ) -> dict[str, Any]:
+        with self._locked_state() as state:
+            request = self._get_request(state, request_id)
+            self._validate_url_token(request, url_token)
             if request.get("state") == "expired":
                 raise SudoApprovalExpired("approval request expired")
             if request.get("state") != "pending":
@@ -779,9 +1006,15 @@ class ApprovalVerifier:
                 "userVerification": "required",
             }
 
-    def approve(self, nonce: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def approve(
+        self,
+        request_id: str,
+        url_token: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         with self._locked_state() as state:
-            request = self._get_request(state, nonce)
+            request = self._get_request(state, request_id)
+            self._validate_url_token(request, url_token)
             if request.get("state") == "expired":
                 raise SudoApprovalExpired("approval request expired")
             if request.get("state") != "pending":
@@ -850,62 +1083,85 @@ class ApprovalVerifier:
             credential["last_used_at"] = now
             request["state"] = "approved"
             request["decided_at"] = now
+            request["decision_id"] = str(uuid.uuid4())
             request["credential_id"] = credential_id
             self._audit(state, "approved", request=request, credential_id=credential_id)
             return self._public_request(request)
 
-    def deny(self, nonce: str) -> dict[str, Any]:
+    def deny(
+        self,
+        request_id: str,
+        url_token: str,
+    ) -> dict[str, Any]:
         with self._locked_state() as state:
-            request = self._get_request(state, nonce)
+            request = self._get_request(state, request_id)
+            self._validate_url_token(request, url_token)
             if request.get("state") == "expired":
                 raise SudoApprovalExpired("approval request expired")
             if request.get("state") != "pending":
                 raise SudoApprovalConflict("approval request was already decided")
             request["state"] = "denied"
             request["decided_at"] = int(self._now())
+            request["decision_id"] = str(uuid.uuid4())
             self._audit(state, "denied", request=request)
             return self._public_request(request)
 
     def consume_approval(
         self,
         *,
-        nonce: str,
-        command: str,
-        requester: str,
-        expires_at: int,
+        request_id: str,
+        request: Any,
+        request_digest: Any,
+        decision_id: Any,
     ) -> dict[str, Any]:
-        command = self._validate_command(command)
-        requester = self._validate_requester(requester)
+        transaction = _validate_exact_transaction(
+            request,
+            broker_id=self.config.broker_id,
+            now=int(self._now()),
+        )
+        digest = _validate_digest(request_digest)
+        decision_id = _canonical_uuid(decision_id, field="decision_id")
+        if transaction["request_id"] != request_id:
+            raise SudoApprovalUnauthorized("consume request_id mismatch")
+        if not hmac.compare_digest(_request_digest(transaction), digest):
+            raise SudoApprovalUnauthorized("consume digest mismatch")
         with self._locked_state() as state:
-            request = self._get_request(state, nonce)
-            if request.get("state") == "expired":
+            stored = self._get_request(state, request_id)
+            if stored.get("state") == "expired":
                 raise SudoApprovalExpired("approval request expired")
-            if request.get("state") != "approved":
+            if stored.get("state") != "approved":
                 raise SudoApprovalConflict("approval request is not consumable")
-            mutation = None
-            if (
-                request.get("command") != command
-                or not hmac.compare_digest(str(request.get("command_sha256")), _command_hash(command))
-            ):
-                mutation = "command"
-            elif request.get("requester") != requester:
-                mutation = "requester"
-            elif int(request.get("expires_at", 0)) != int(expires_at):
-                mutation = "expiry"
-            if mutation:
-                self._audit(state, "consume_rejected", request=request, reason=f"{mutation}_mutation")
-                raise SudoApprovalUnauthorized(
-                    f"approved request does not match the exact {mutation}"
-                )
-            request["state"] = "consumed"
-            request["consumed_at"] = int(self._now())
+            if stored["transaction"] != transaction:
+                self._audit(state, "consume_rejected", request=stored, reason="transaction_mutation")
+                raise SudoApprovalUnauthorized("consume transaction mismatch")
+            if not hmac.compare_digest(str(stored["request_digest"]), digest):
+                raise SudoApprovalUnauthorized("consume digest mismatch")
+            if stored.get("decision_id") != decision_id:
+                raise SudoApprovalUnauthorized("consume decision_id mismatch")
+            stored["state"] = "consumed"
+            stored["consumed_at"] = int(self._now())
             self._audit(
                 state,
                 "consumed",
-                request=request,
-                credential_id=request.get("credential_id"),
+                request=stored,
+                credential_id=stored.get("credential_id"),
             )
-            return self._public_request(request)
+            return self.decision_status_from_record(stored)
+
+    @staticmethod
+    def decision_status_from_record(request: dict[str, Any]) -> dict[str, Any]:
+        transaction = request["transaction"]
+        return {
+            "protocol_version": 1,
+            "request_id": transaction["request_id"],
+            "request_digest": request["request_digest"],
+            "broker_nonce": transaction["broker_nonce"],
+            "expires_at": transaction["expires_at"],
+            "status": "consumed",
+            "decision_id": request["decision_id"],
+            "decided_at": request["decided_at"],
+            "consumed_at": request["consumed_at"],
+        }
 
     def audit_events(self) -> list[dict[str, Any]]:
         with self._locked_state() as state:
@@ -915,6 +1171,26 @@ class ApprovalVerifier:
 def configured_verifier() -> ApprovalVerifier:
     """Construct the enabled verifier for request handlers."""
     return ApprovalVerifier.from_env()
+
+
+def validate_broker_authorization(handler, verifier: ApprovalVerifier) -> None:
+    """Authenticate the one dedicated desktop broker without WebUI sessions."""
+    token_file = verifier.config.broker_token_file
+    if token_file is None:
+        raise SudoApprovalConfigError("sudo approval broker token file is not configured")
+    try:
+        stat = token_file.stat()
+        if stat.st_mode & 0o077:
+            raise SudoApprovalConfigError("sudo approval broker token permissions are too broad")
+        token = token_file.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as exc:
+        raise SudoApprovalConfigError("sudo approval broker token is unavailable") from exc
+    if not (32 <= len(token) <= 512) or any(char.isspace() for char in token):
+        raise SudoApprovalConfigError("sudo approval broker token is malformed")
+    authorization = str(handler.headers.get("Authorization", ""))
+    expected = f"Bearer {token}"
+    if not hmac.compare_digest(authorization, expected):
+        raise SudoApprovalUnauthorized("broker identity is unauthorized")
 
 
 def validate_request_host(handler, verifier: ApprovalVerifier) -> None:

@@ -5310,6 +5310,10 @@ def apply_cors_preflight_headers(handler) -> None:
 
 def _csrf_exempt_path(path: str) -> bool:
     """Paths that cannot or must not carry a session CSRF token."""
+    if path.startswith("/api/sudo-approval/broker/v1/"):
+        # The broker API never accepts WebUI cookies. Its dedicated bearer
+        # identity and exact-host check are enforced by sudo_approval_routes.
+        return True
     if path in {
         "/api/sudo-approval/options",
         "/api/sudo-approval/approve",

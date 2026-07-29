@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Trusted local administration for the sudo approval verifier.
-
-This command deliberately has no remote API equivalent.  Filesystem access to
-the verifier's private state directory is the enrollment/revocation/request
-creation trust boundary until the separate trusted-agent/actor guard lands.
-"""
+"""Trusted local credential administration for the sudo approval verifier."""
 from __future__ import annotations
 
 import argparse
@@ -34,24 +29,6 @@ def _parser() -> argparse.ArgumentParser:
     target.add_argument("--credential-id")
     target.add_argument("--all", action="store_true")
 
-    request = subparsers.add_parser("request", help="create an exact sudo approval request")
-    request.add_argument("--requester", required=True)
-    request.add_argument(
-        "--command",
-        required=True,
-        help="exact command string; no shell normalization is performed",
-    )
-    request.add_argument("--ttl", type=int)
-
-    status = subparsers.add_parser("status", help="show one request")
-    status.add_argument("--nonce", required=True)
-
-    consume = subparsers.add_parser("consume", help="consume one exact approved request")
-    consume.add_argument("--nonce", required=True)
-    consume.add_argument("--requester", required=True)
-    consume.add_argument("--command", required=True)
-    consume.add_argument("--expires-at", type=int, required=True)
-
     subparsers.add_parser("audit", help="show metadata-only approval audit events")
     return parser
 
@@ -69,23 +46,6 @@ def _run(args: argparse.Namespace) -> dict | list:
                 revoke_all=args.all,
             )
         }
-    if args.action == "request":
-        result = verifier.create_request(
-            command=args.command,
-            requester=args.requester,
-            ttl_seconds=args.ttl,
-        )
-        result["url"] = f"{verifier.config.origin}/sudo-approval/{result['nonce']}"
-        return result
-    if args.action == "status":
-        return verifier.request_status(args.nonce)
-    if args.action == "consume":
-        return verifier.consume_approval(
-            nonce=args.nonce,
-            command=args.command,
-            requester=args.requester,
-            expires_at=args.expires_at,
-        )
     if args.action == "audit":
         return verifier.audit_events()
     raise AssertionError(f"unsupported action: {args.action}")

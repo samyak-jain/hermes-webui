@@ -1,46 +1,71 @@
 # Request-bound sudo approval verifier
 
-This optional subsystem provides a sessionless WebAuthn ceremony for one exact
-sudo request. It is intentionally separate from WebUI login passkeys, login
-sessions, `settings.json`, and the chat/tool approval queue.
+This optional subsystem is the gateway-side verifier for the desktop
+`sudo-approval-broker`. It is separate from WebUI login passkeys, sessions,
+cookies, `settings.json`, and chat/tool approvals.
 
-It is a local implementation checkpoint. It does **not** install sudoers rules,
-execute sudo, expose a remote request-creation API, enroll a real credential, or
-change Cloudflare/Kumo infrastructure.
+## One authoritative transaction
 
-## Security contract
+The desktop broker creates a closed protocol-v1 transaction containing:
 
-An approval request contains:
+- purpose `sudo-approval/v1`;
+- canonical request UUID and 256-bit broker nonce;
+- exact argv and its exact `shlex.join(argv)` display serialization;
+- normalized absolute cwd;
+- requester OS UID and worker ID;
+- dedicated broker identity; and
+- integer creation/expiry times with a 60–120 second lifetime.
 
-- a 256-bit single-use nonce,
-- the exact command string and its SHA-256 hash,
-- the requester identity supplied by the trusted local caller,
-- an integer expiry 60–120 seconds after creation, and
-- a WebAuthn challenge equal to the SHA-256 digest of the canonical binding
-  `{purpose, nonce, command_sha256, requester, expires_at}`.
+Canonical JSON is UTF-8 with sorted keys and compact separators. Its SHA-256
+is the `request_digest`; the WebAuthn challenge is the base64url form of those
+same 32 digest bytes. The verifier independently validates the closed schema,
+canonical command serialization, broker identity, timestamps, and digest
+before storing the transaction unchanged.
 
-The verifier accepts only `webauthn.get` assertions for its configured exact
-origin and RP ID. It validates the RP ID hash, user-presence bit, user-
-verification bit, ES256 signature, credential ID, and signature counter when
-the authenticator supplies a non-zero counter. Approve changes `pending` to
-`approved`; the trusted local consumer must then repeat the exact nonce,
-command, requester, and expiry before the verifier atomically changes the
-record to `consumed`. No second approval or consumption can succeed.
+The authenticator assertion must be `webauthn.get` for the exact origin/RP. The
+verifier checks challenge, origin, RP-ID hash, UP, UV, credential authorization,
+ES256 signature, and non-zero signature counter policy.
 
-Deny is intentionally not a WebAuthn ceremony: knowledge of the unguessable
-request URL can cancel a pending request but can never grant privilege. Denial
-is a terminal single-use transition and is retained in the metadata-only audit
-history. This trades possible denial-of-service by a leaked request URL for a
-fast safe refusal path.
+States are:
 
-State uses an explicit private directory, POSIX file locking, atomic fsync +
-rename writes, mode 0700 for the directory, and mode 0600 for files. Audit rows
-contain command hashes, not command text. The active request record must retain
-the exact command so it can be displayed and matched at consumption.
+`pending → approved → consumed`
 
-## Fail-closed configuration
+or:
 
-The verifier is unavailable unless all of these are explicitly configured:
+`pending → denied|expired`
+
+An approved-but-unconsumed request also becomes `expired` at its transaction
+expiry. The authenticated broker must repeat the complete transaction, digest,
+and decision ID to atomically receive a single `consumed` acknowledgment.
+Only then may it contact its root executor. Duplicate approval, duplicate
+consumption, mutation, mismatch, or restart replay fails closed.
+
+## Authentication and URL authority
+
+Create/status/consume routes require all of:
+
+- the exact configured approval hostname;
+- HTTPS in production;
+- a bearer token loaded from a private file; and
+- a transaction whose `broker_id` equals the configured dedicated identity.
+
+The bearer token is shared only with the dedicated desktop broker service. It
+is not accepted from a WebUI session and never appears in request state,
+notification payloads, URLs, audits, or command environments.
+
+The create response returns:
+
+`/sudo-approval/<request-id>/<url-token>`
+
+Only the URL token hash is stored. The token can display or deny that one
+request. It cannot approve it, consume it, list requests, or access any other
+WebUI surface. There is deliberately no WebUI login, Cloudflare Access OTP, or
+request-list step before the passkey action. A leaked URL can cause denial of
+service, never privilege.
+
+## Configuration
+
+The verifier is unavailable unless every value is explicit:
 
 ```sh
 HERMES_WEBUI_SUDO_APPROVAL_ENABLED=1
@@ -48,16 +73,18 @@ HERMES_WEBUI_SUDO_APPROVAL_STATE_DIR=/var/lib/hermes-sudo-approval
 HERMES_WEBUI_SUDO_APPROVAL_RP_ID=approval.example.com
 HERMES_WEBUI_SUDO_APPROVAL_ORIGIN=https://approval.example.com
 HERMES_WEBUI_SUDO_APPROVAL_TTL_SECONDS=90
+HERMES_WEBUI_SUDO_APPROVAL_BROKER_ID=samyak-desktop
+HERMES_WEBUI_SUDO_APPROVAL_BROKER_TOKEN_FILE=/run/secrets/sudo-approval-broker.token
 ```
 
-The origin must be exact and HTTPS except for loopback development. Every
-approval HTTP route also requires the request `Host` to match that configured
-origin. Unsafe browser calls require the exact configured `Origin`; WebUI
-cookies and CSRF tokens are neither read nor accepted as approval authority.
+The private state directory must not be the broad WebUI state directory or a
+child of it. It uses POSIX locking, atomic fsync+rename persistence, mode 0700
+for the directory, and mode 0600 for files. Audit rows retain metadata and
+digests but not command text or WebAuthn payloads.
 
-## Trusted local administration
+## Credential administration
 
-The administration command has no remote route:
+Credential enrollment/revocation remains local-only:
 
 ```sh
 ./scripts/sudo_approval_admin.py enroll --label "Phone approval passkey"
@@ -66,75 +93,43 @@ The administration command has no remote route:
 ./scripts/sudo_approval_admin.py revoke --all
 ```
 
-`enroll` prints a high-entropy, five-minute, one-time URL. Registration requires
-UP and UV and accepts only an ES256 P-256 credential with `none` attestation.
-The token is stored only as a SHA-256 digest. Revocation followed by a newly
-minted enrollment URL is the re-enrollment/recovery path.
+Enrollment URLs are high-entropy, five-minute, one-use capabilities. Enrollment
+requires UP and UV and accepts only ES256 P-256 credentials with `none`
+attestation. Revocation plus a new enrollment URL is the recovery path.
 
-The local request/consumer seam is:
+## Routes
 
-```sh
-./scripts/sudo_approval_admin.py request \
-  --requester 'paseo:actor-id' \
-  --command '/usr/bin/systemctl restart example.service'
+Browser capability:
 
-./scripts/sudo_approval_admin.py consume \
-  --nonce NONCE \
-  --requester 'paseo:actor-id' \
-  --command '/usr/bin/systemctl restart example.service' \
-  --expires-at UNIX_SECONDS
-```
+- `/sudo-approval/<request-id>/<url-token>`
+- `/api/sudo-approval/requests/<request-id>/<url-token>`
+- `/api/sudo-approval/options`, `/approve`, `/deny`
 
-The command is an exact UTF-8 string. No shell parsing, whitespace
-normalization, argument reordering, or path resolution occurs. A future sudo
-broker must define and preserve the exact representation it executes; it must
-not reconstruct a different shell command after consumption.
+Broker bearer API:
 
-## Sessionless browser routes
+- `POST /api/sudo-approval/broker/v1/requests`
+- `GET /api/sudo-approval/broker/v1/requests/<request-id>/decision`
+- `POST /api/sudo-approval/broker/v1/requests/<request-id>/consume`
 
-- `/sudo-approval/<nonce>` — exact request, requester, expiry, Approve/Deny.
-- `/sudo-enrollment/<token>` — trusted-path one-time registration.
-- `/api/sudo-approval/requests/<nonce>` — one request only.
-- `/api/sudo-approval/options`, `/approve`, `/deny` — browser ceremony.
-- `/api/sudo-approval/enrollments/<token>`, `/enrollment/options`,
-  `/enrollment/finish` — one-time enrollment ceremony.
+Enrollment:
 
-There is no login, OTP, broad WebUI session, request-list endpoint, remote
-request-creation endpoint, or remote consume endpoint.
+- `/sudo-enrollment/<token>`
+- `/api/sudo-approval/enrollments/<token>`
+- `/api/sudo-approval/enrollment/options`, `/enrollment/finish`
 
-## Prepared Kumo/Cloudflare shape (not applied)
+## Kumo deployment boundary
 
-Later Kumo review should add a dedicated hostname such as
-`approval.<domain>` to the existing Cloudflare Tunnel and route it to the same
-loopback WebUI origin. Configure the explicit verifier environment values
-and mount a dedicated state path into the WebUI container. Do not put approval
-state under `/opt/data/webui` and do not reuse `/opt/data/webui/passkeys.json`.
+Kumo routes `approval.<domain>` through the existing outbound Cloudflare
+Tunnel to the WebUI loopback port but creates no Access application for that
+hostname. The existing `webui.<domain>` OTP policy stays unchanged.
 
-The existing `webui.<domain>` Cloudflare Access application and operator-email
-OTP policy should remain unchanged. The dedicated approval hostname must not
-redirect through that login/OTP flow: the page's only positive authority is
-the per-request UV-required WebAuthn assertion. The request path is already
-host-pinned in the application, so serving it through the broad WebUI hostname
-fails closed.
+Verifier state is mounted from a dedicated EFS directory outside
+`/mnt/efs/hermes`; the broader gateway container cannot see it. Kumo fetches
+the broker token from its own SSM parameter into tmpfs and mounts that file
+read-only into WebUI. The corresponding desktop token is installed separately
+as a systemd credential.
 
-Before any remote request/consume surface is added, the parent trusted-
-agent/actor guard must define and enforce:
-
-- which local actor may create a request,
-- the stable requester identity that is bound into it,
-- how that actor authenticates to a verifier hosted on Kumo,
-- how the returned single-use approval reaches a narrowly privileged desktop
-  sudo broker, and
-- the exact argv/string serialization used by that broker.
-
-No Cloudflare resource, tunnel ingress, container mount, environment setting,
-sudoers entry, host service, or credential enrollment is part of this
-checkpoint.
-
-## Authenticator scope
-
-UV proves that the authenticator performed its configured user-verification
-method. WebAuthn does not prove that the method was specifically a fingerprint,
-and a synchronized platform passkey may exist on more than one device. If the
-deployment claim requires a phone-only/device-bound key, enrollment policy and
-attestation/device management need a separately reviewed enforcement mechanism.
+UV proves the authenticator performed its configured user-verification method;
+WebAuthn does not prove that method was specifically a fingerprint. A synced
+platform passkey may exist on multiple devices, so a phone-only claim requires
+separate authenticator enrollment/device policy.

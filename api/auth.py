@@ -14,6 +14,7 @@ import secrets
 import tempfile
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 from api.config import STATE_DIR, get_config, load_settings
@@ -66,15 +67,64 @@ _PUBLIC_SUDO_APPROVAL_API_PATHS = frozenset({
     '/api/sudo-approval/enrollment/finish',
 })
 
+_SUDO_APPROVAL_STATIC_PATHS = frozenset({
+    '/static/sudo-approval.css',
+    '/static/sudo-approval.js',
+})
+
+_SUDO_APPROVAL_UUID = (
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+_SUDO_APPROVAL_TOKEN = r"[A-Za-z0-9_-]{43}"
+_SUDO_APPROVAL_CAPABILITY = r"[A-Za-z0-9_-]{20,128}"
+
 
 def _is_public_sudo_approval_path(path: str) -> bool:
-    return (
-        path.startswith('/sudo-approval/')
-        or path.startswith('/sudo-enrollment/')
-        or path.startswith('/api/sudo-approval/requests/')
-        or path.startswith('/api/sudo-approval/enrollments/')
-        or path in _PUBLIC_SUDO_APPROVAL_API_PATHS
+    if path in _PUBLIC_SUDO_APPROVAL_API_PATHS:
+        return True
+    patterns = (
+        rf"/sudo-approval/{_SUDO_APPROVAL_UUID}/{_SUDO_APPROVAL_TOKEN}",
+        rf"/sudo-enrollment/{_SUDO_APPROVAL_CAPABILITY}",
+        rf"/api/sudo-approval/requests/{_SUDO_APPROVAL_UUID}/{_SUDO_APPROVAL_TOKEN}",
+        rf"/api/sudo-approval/enrollments/{_SUDO_APPROVAL_CAPABILITY}",
+        r"/api/sudo-approval/broker/v1/requests",
+        rf"/api/sudo-approval/broker/v1/requests/{_SUDO_APPROVAL_UUID}/decision",
+        rf"/api/sudo-approval/broker/v1/requests/{_SUDO_APPROVAL_UUID}/consume",
     )
+    return any(re.fullmatch(pattern, path) for pattern in patterns)
+
+
+def _approval_origin_host() -> str:
+    value = os.getenv("HERMES_WEBUI_SUDO_APPROVAL_ORIGIN", "").strip()
+    try:
+        return (urllib.parse.urlparse(value).netloc or "").lower()
+    except ValueError:
+        return ""
+
+
+def _is_allowed_on_approval_origin(path: str) -> bool:
+    return _is_public_sudo_approval_path(path) or path in _SUDO_APPROVAL_STATIC_PATHS
+
+
+def _enforce_approval_origin_fence(handler, path: str) -> bool:
+    """Keep the no-Access hostname from exposing the rest of WebUI."""
+    approval_host = _approval_origin_host()
+    headers = getattr(handler, "headers", {})
+    actual_host = str(headers.get("Host", "")).strip().lower()
+    if not approval_host or actual_host != approval_host:
+        return True
+    if _is_allowed_on_approval_origin(path):
+        return True
+    body = b'{"error":"Not found"}' if path.startswith("/api/") else b"Not found"
+    handler.send_response(404)
+    handler.send_header(
+        "Content-Type",
+        "application/json" if path.startswith("/api/") else "text/plain; charset=utf-8",
+    )
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+    return False
 
 COOKIE_NAME = 'hermes_session'
 CSRF_HEADER_NAME = 'X-Hermes-CSRF-Token'
@@ -747,6 +797,8 @@ def _safe_login_inner_next(query: str | None) -> str:
 def check_auth(handler, parsed) -> bool:
     """Check if request is authorized. Returns True if OK.
     If not authorized, sends 401 (API) or 302 redirect (page) and returns False."""
+    if not _enforce_approval_origin_fence(handler, parsed.path):
+        return False
     if not is_auth_enabled():
         return True
     # Public paths don't require auth
