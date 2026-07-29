@@ -75,12 +75,20 @@ HERMES_WEBUI_SUDO_APPROVAL_ORIGIN=https://approval.example.com
 HERMES_WEBUI_SUDO_APPROVAL_TTL_SECONDS=90
 HERMES_WEBUI_SUDO_APPROVAL_BROKER_ID=samyak-desktop
 HERMES_WEBUI_SUDO_APPROVAL_BROKER_TOKEN_FILE=/run/secrets/sudo-approval-broker.token
+HERMES_WEBUI_SUDO_APPROVAL_BOT_UPDATES_WEBHOOK_FILE=/run/secrets/sudo-approval-bot-updates.webhook
 ```
 
 The private state directory must not be the broad WebUI state directory or a
 child of it. It uses POSIX locking, atomic fsync+rename persistence, mode 0700
 for the directory, and mode 0600 for files. Audit rows retain metadata and
 digests but not command text or WebAuthn payloads.
+
+The bot-updates file contains a channel-scoped Discord HTTPS webhook URL. It is
+required when the verifier is enabled, must be mode 0600, and is never returned
+to the desktop broker. The broker-authenticated `/v1/bot-updates` relay accepts
+only the literal `bot-updates` target and fields matching an already-registered
+request, then sends a notification with the exact command, requester UID and
+worker ID, Unix expiry, and deep link. It exposes no approve or deny action.
 
 ## Credential administration
 
@@ -107,6 +115,7 @@ Browser capability:
 
 Broker bearer API:
 
+- `POST /v1/bot-updates`
 - `POST /api/sudo-approval/broker/v1/requests`
 - `GET /api/sudo-approval/broker/v1/requests/<request-id>/decision`
 - `POST /api/sudo-approval/broker/v1/requests/<request-id>/consume`

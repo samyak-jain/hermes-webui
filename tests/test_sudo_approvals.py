@@ -5,6 +5,8 @@ import copy
 import hashlib
 import io
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -354,6 +356,143 @@ def test_replay_rejected_across_verifier_restarts(verifier):
         )
 
 
+@pytest.mark.parametrize(
+    ("accepted_count", "rollback_count"),
+    [
+        (5, 5),
+        (5, 4),
+        (1, 0),
+    ],
+)
+def test_sign_counter_rollback_rejected_after_restart(
+    verifier,
+    accepted_count,
+    rollback_count,
+):
+    instance, config, clock, private_key = verifier
+    _transaction_value, _registration, request_id, url_token = _register(
+        instance,
+        clock,
+    )
+    _approve(
+        instance,
+        private_key,
+        request_id,
+        url_token,
+        sign_count=accepted_count,
+    )
+    assert instance.list_credentials()[0]["sign_count"] == accepted_count
+
+    restarted = ApprovalVerifier(config, now=clock)
+    _transaction_value, _registration, second_id, second_token = _register(
+        restarted,
+        clock,
+        request_id="22222222-2222-4222-8222-222222222222",
+        broker_nonce="B" * 43,
+    )
+    options = restarted.approval_options(second_id, second_token)
+    rollback = _assertion_payload(
+        options["challenge"],
+        private_key,
+        sign_count=rollback_count,
+    )
+    with pytest.raises(SudoApprovalUnauthorized, match="counter"):
+        restarted.approve(second_id, second_token, rollback)
+
+    assert restarted.decision_status(second_id)["status"] == "pending"
+    assert restarted.list_credentials()[0]["sign_count"] == accepted_count
+
+
+def test_zero_sign_counter_is_accepted_and_persisted(verifier):
+    instance, config, clock, private_key = verifier
+    _transaction_value, _registration, request_id, url_token = _register(
+        instance,
+        clock,
+    )
+    _approve(instance, private_key, request_id, url_token, sign_count=0)
+
+    restarted = ApprovalVerifier(config, now=clock)
+    assert restarted.list_credentials()[0]["sign_count"] == 0
+
+
+def test_bot_updates_delivery_uses_channel_scoped_exact_payload(verifier, tmp_path):
+    instance, config, clock, _private_key = verifier
+    transaction, registration, _request_id, _url_token = _register(instance, clock)
+    received = {}
+
+    class CaptureHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            received["path"] = self.path
+            received["content_type"] = self.headers["Content-Type"]
+            received["body"] = json.loads(self.rfile.read(length))
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        webhook_file = tmp_path / "bot-updates.webhook"
+        webhook_file.write_text(
+            f"http://127.0.0.1:{server.server_port}/discord-webhook",
+            encoding="ascii",
+        )
+        webhook_file.chmod(0o600)
+        notifier = ApprovalVerifier(
+            SudoApprovalConfig(
+                state_dir=config.state_dir,
+                rp_id=config.rp_id,
+                origin=config.origin,
+                ttl_seconds=config.ttl_seconds,
+                broker_id=config.broker_id,
+                broker_token_file=config.broker_token_file,
+                bot_updates_webhook_file=webhook_file,
+            ),
+            now=clock,
+            allow_insecure_bot_updates_for_tests=True,
+        )
+        notifier.notify_bot_updates(
+            {
+                "protocol_version": 1,
+                "channel": "bot-updates",
+                "request_id": transaction["request_id"],
+                "request_digest": registration["request_digest"],
+                "command": transaction["command"],
+                "requester_uid": transaction["requester_uid"],
+                "requester_worker_id": transaction["requester_worker_id"],
+                "approval_url": registration["approval_url"],
+                "expires_at": transaction["expires_at"],
+            }
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+    assert received["path"] == "/discord-webhook"
+    assert received["content_type"] == "application/json"
+    assert received["body"]["allowed_mentions"] == {"parse": []}
+    fields = {
+        field["name"]: field["value"]
+        for field in received["body"]["embeds"][0]["fields"]
+    }
+    assert fields == {
+        "Exact command": transaction["command"],
+        "Requester UID": str(transaction["requester_uid"]),
+        "Requester worker": transaction["requester_worker_id"],
+        "Expires at (Unix)": str(transaction["expires_at"]),
+        "Review request": registration["approval_url"],
+    }
+    serialized = json.dumps(received["body"])
+    assert BROKER_TOKEN not in serialized
+    assert "approve" not in serialized.lower()
+    assert "deny" not in serialized.lower()
+
+
 def test_pending_and_approved_unconsumed_requests_expire_after_restart(verifier):
     instance, config, clock, private_key = verifier
     _pending_tx, _registration, pending_id, pending_token = _register(instance, clock)
@@ -609,6 +748,10 @@ def test_environment_config_requires_separate_state_and_broker_identity(
     monkeypatch.setenv(
         "HERMES_WEBUI_SUDO_APPROVAL_BROKER_TOKEN_FILE",
         str(tmp_path / "broker.token"),
+    )
+    monkeypatch.setenv(
+        "HERMES_WEBUI_SUDO_APPROVAL_BOT_UPDATES_WEBHOOK_FILE",
+        str(tmp_path / "bot-updates.webhook"),
     )
     with pytest.raises(SudoApprovalConfigError, match="broad WebUI state"):
         config_from_env()

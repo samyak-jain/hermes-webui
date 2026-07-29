@@ -23,6 +23,8 @@ import shlex
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -88,6 +90,10 @@ class SudoApprovalConflict(SudoApprovalError):
     """A single-use state transition was already completed or is invalid."""
 
 
+class SudoApprovalDeliveryError(SudoApprovalError):
+    """The notification-only bot-updates delivery failed closed."""
+
+
 @dataclass(frozen=True)
 class SudoApprovalConfig:
     state_dir: Path
@@ -96,6 +102,7 @@ class SudoApprovalConfig:
     ttl_seconds: int = _DEFAULT_TTL_SECONDS
     broker_id: str = "samyak-desktop"
     broker_token_file: Path | None = None
+    bot_updates_webhook_file: Path | None = None
 
 
 def _truthy(value: str | None) -> bool:
@@ -150,6 +157,11 @@ def _validate_config(config: SudoApprovalConfig) -> SudoApprovalConfig:
         if config.broker_token_file is not None
         else None
     )
+    webhook_file = (
+        Path(config.bot_updates_webhook_file).expanduser().resolve()
+        if config.bot_updates_webhook_file is not None
+        else None
+    )
     return SudoApprovalConfig(
         state_dir=state_dir,
         rp_id=rp_id,
@@ -157,6 +169,7 @@ def _validate_config(config: SudoApprovalConfig) -> SudoApprovalConfig:
         ttl_seconds=int(config.ttl_seconds),
         broker_id=broker_id,
         broker_token_file=token_file,
+        bot_updates_webhook_file=webhook_file,
     )
 
 
@@ -171,9 +184,20 @@ def config_from_env() -> SudoApprovalConfig:
     broker_token_file = os.getenv(
         "HERMES_WEBUI_SUDO_APPROVAL_BROKER_TOKEN_FILE", ""
     ).strip()
-    if not state_dir or not rp_id or not origin or not broker_id or not broker_token_file:
+    bot_updates_webhook_file = os.getenv(
+        "HERMES_WEBUI_SUDO_APPROVAL_BOT_UPDATES_WEBHOOK_FILE", ""
+    ).strip()
+    if (
+        not state_dir
+        or not rp_id
+        or not origin
+        or not broker_id
+        or not broker_token_file
+        or not bot_updates_webhook_file
+    ):
         raise SudoApprovalConfigError(
-            "sudo approval requires state, RP/origin, broker identity, and broker token file"
+            "sudo approval requires state, RP/origin, broker identity, broker token, "
+            "and bot-updates webhook files"
         )
     ttl_raw = os.getenv("HERMES_WEBUI_SUDO_APPROVAL_TTL_SECONDS", "").strip()
     try:
@@ -188,6 +212,7 @@ def config_from_env() -> SudoApprovalConfig:
             ttl,
             broker_id,
             Path(broker_token_file),
+            Path(bot_updates_webhook_file),
         )
     )
     from api.config import STATE_DIR
@@ -486,10 +511,14 @@ class ApprovalVerifier:
         *,
         now: Callable[[], float] = time.time,
         random_bytes: Callable[[int], bytes] = secrets.token_bytes,
+        allow_insecure_bot_updates_for_tests: bool = False,
     ) -> None:
         self.config = _validate_config(config)
         self._now = now
         self._random_bytes = random_bytes
+        self._allow_insecure_bot_updates_for_tests = (
+            allow_insecure_bot_updates_for_tests
+        )
         if fcntl is None:
             raise SudoApprovalConfigError("sudo approval requires POSIX file locking")
         if serialization is None or hashes is None or ec is None:
@@ -912,6 +941,169 @@ class ApprovalVerifier:
             ),
         }
 
+    def _read_bot_updates_webhook(self) -> str:
+        webhook_file = self.config.bot_updates_webhook_file
+        if webhook_file is None:
+            raise SudoApprovalConfigError(
+                "sudo approval bot-updates webhook file is not configured"
+            )
+        try:
+            stat = webhook_file.stat()
+            if stat.st_mode & 0o077:
+                raise SudoApprovalConfigError(
+                    "sudo approval bot-updates webhook permissions are too broad"
+                )
+            webhook_url = webhook_file.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError) as exc:
+            raise SudoApprovalConfigError(
+                "sudo approval bot-updates webhook is unavailable"
+            ) from exc
+        parsed = urlparse(webhook_url)
+        path_parts = parsed.path.split("/")
+        production_url = (
+            parsed.scheme == "https"
+            and parsed.hostname == "discord.com"
+            and parsed.port is None
+            and len(path_parts) == 5
+            and path_parts[1:3] == ["api", "webhooks"]
+            and bool(path_parts[3])
+            and bool(path_parts[4])
+        )
+        test_url = (
+            self._allow_insecure_bot_updates_for_tests
+            and parsed.scheme == "http"
+            and parsed.hostname in {"127.0.0.1", "localhost"}
+            and parsed.port is not None
+            and bool(parsed.path)
+        )
+        if (
+            not (production_url or test_url)
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise SudoApprovalConfigError(
+                "sudo approval bot-updates webhook must be a channel-scoped "
+                "Discord HTTPS webhook"
+            )
+        return webhook_url
+
+    @staticmethod
+    def _bot_updates_message(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "allowed_mentions": {"parse": []},
+            "embeds": [
+                {
+                    "title": "Sudo approval requested",
+                    "fields": [
+                        {
+                            "name": "Exact command",
+                            "value": payload["command"],
+                            "inline": False,
+                        },
+                        {
+                            "name": "Requester UID",
+                            "value": str(payload["requester_uid"]),
+                            "inline": True,
+                        },
+                        {
+                            "name": "Requester worker",
+                            "value": payload["requester_worker_id"],
+                            "inline": True,
+                        },
+                        {
+                            "name": "Expires at (Unix)",
+                            "value": str(payload["expires_at"]),
+                            "inline": False,
+                        },
+                        {
+                            "name": "Review request",
+                            "value": payload["approval_url"],
+                            "inline": False,
+                        },
+                    ],
+                    "footer": {
+                        "text": (
+                            f"request {payload['request_id']} · "
+                            f"digest {payload['request_digest']}"
+                        )
+                    },
+                }
+            ],
+        }
+
+    def _deliver_bot_updates(self, webhook_url: str, payload: dict[str, Any]) -> None:
+        body = _canonical_json(self._bot_updates_message(payload))
+        request = urllib.request.Request(
+            webhook_url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "hermes-webui-sudo-approval/1",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                if response.status not in {200, 204}:
+                    raise SudoApprovalDeliveryError(
+                        "bot-updates webhook rejected notification"
+                    )
+                response.read(64 * 1024 + 1)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise SudoApprovalDeliveryError(
+                "bot-updates webhook delivery failed"
+            ) from exc
+
+    def notify_bot_updates(self, payload: Any) -> None:
+        expected = {
+            "protocol_version",
+            "channel",
+            "request_id",
+            "request_digest",
+            "command",
+            "requester_uid",
+            "requester_worker_id",
+            "approval_url",
+            "expires_at",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise SudoApprovalError("bot-updates payload fields are invalid")
+        if payload["protocol_version"] != 1 or payload["channel"] != "bot-updates":
+            raise SudoApprovalError("bot-updates notification target is invalid")
+        request_id = _canonical_uuid(payload["request_id"], field="request_id")
+        with self._locked_state() as state:
+            request = self._get_request(state, request_id)
+            transaction = request["transaction"]
+            expected_values = {
+                "request_digest": request["request_digest"],
+                "command": transaction["command"],
+                "requester_uid": transaction["requester_uid"],
+                "requester_worker_id": transaction["requester_worker_id"],
+                "expires_at": transaction["expires_at"],
+            }
+            if any(payload[key] != value for key, value in expected_values.items()):
+                raise SudoApprovalUnauthorized(
+                    "bot-updates notification does not match the registered request"
+                )
+            parsed_url = urlparse(str(payload["approval_url"]))
+            path_parts = parsed_url.path.split("/")
+            if (
+                parsed_url.scheme != "https"
+                or parsed_url.netloc != urlparse(self.config.origin).netloc
+                or len(path_parts) != 4
+                or path_parts[1:3] != ["sudo-approval", request_id]
+                or not _NONCE_RE.fullmatch(path_parts[3])
+                or parsed_url.query
+                or parsed_url.fragment
+            ):
+                raise SudoApprovalUnauthorized(
+                    "bot-updates approval URL is not the registered request capability"
+                )
+            self._validate_url_token(request, path_parts[3])
+        self._deliver_bot_updates(self._read_bot_updates_webhook(), payload)
+
     def _get_request(self, state: dict[str, Any], request_id: str) -> dict[str, Any]:
         request_id = _canonical_uuid(request_id, field="request_id")
         request = state["requests"].get(request_id)
@@ -1075,11 +1267,11 @@ class ApprovalVerifier:
                 raise SudoApprovalUnauthorized("sudo approval signature verification failed") from exc
             old_count = int(credential.get("sign_count") or 0)
             new_count = int(parsed["sign_count"])
-            if new_count and old_count and new_count <= old_count:
+            if (old_count != 0 or new_count != 0) and new_count <= old_count:
                 self._audit(state, "approval_rejected", request=request, reason="sign_count")
                 raise SudoApprovalUnauthorized("sudo approval sign counter did not advance")
             now = int(self._now())
-            credential["sign_count"] = new_count or old_count
+            credential["sign_count"] = new_count
             credential["last_used_at"] = now
             request["state"] = "approved"
             request["decided_at"] = now

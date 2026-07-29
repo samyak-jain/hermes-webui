@@ -83,6 +83,7 @@ def _is_public_sudo_approval_path(path: str) -> bool:
     if path in _PUBLIC_SUDO_APPROVAL_API_PATHS:
         return True
     patterns = (
+        r"/v1/bot-updates",
         rf"/sudo-approval/{_SUDO_APPROVAL_UUID}/{_SUDO_APPROVAL_TOKEN}",
         rf"/sudo-enrollment/{_SUDO_APPROVAL_CAPABILITY}",
         rf"/api/sudo-approval/requests/{_SUDO_APPROVAL_UUID}/{_SUDO_APPROVAL_TOKEN}",

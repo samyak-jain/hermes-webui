@@ -11,6 +11,7 @@ from api.helpers import j, t
 from api.sudo_approvals import (
     SudoApprovalConfigError,
     SudoApprovalConflict,
+    SudoApprovalDeliveryError,
     SudoApprovalError,
     SudoApprovalExpired,
     SudoApprovalUnauthorized,
@@ -60,6 +61,8 @@ def _error_response(handler, exc: SudoApprovalError):
         return j(handler, {"error": str(exc)}, status=409)
     if isinstance(exc, SudoApprovalUnauthorized):
         return j(handler, {"error": str(exc)}, status=403)
+    if isinstance(exc, SudoApprovalDeliveryError):
+        return j(handler, {"error": str(exc)}, status=502)
     return j(handler, {"error": str(exc)}, status=400)
 
 
@@ -149,6 +152,7 @@ def handle_sudo_approval_get(handler, parsed) -> bool:
 def handle_sudo_approval_post(handler, parsed, body: dict[str, Any]) -> bool:
     """Handle broker transport and browser-facing WebAuthn transitions."""
     broker_create = parsed.path == "/api/sudo-approval/broker/v1/requests"
+    bot_updates = parsed.path == "/v1/bot-updates"
     broker_consume = _BROKER_CONSUME_RE.fullmatch(parsed.path)
     browser_actions = {
         "/api/sudo-approval/options",
@@ -157,15 +161,23 @@ def handle_sudo_approval_post(handler, parsed, body: dict[str, Any]) -> bool:
         "/api/sudo-approval/enrollment/options",
         "/api/sudo-approval/enrollment/finish",
     }
-    if not broker_create and broker_consume is None and parsed.path not in browser_actions:
+    if (
+        not broker_create
+        and not bot_updates
+        and broker_consume is None
+        and parsed.path not in browser_actions
+    ):
         return False
     try:
         verifier = configured_verifier()
         validate_request_host(handler, verifier)
-        if broker_create or broker_consume is not None:
+        if broker_create or bot_updates or broker_consume is not None:
             validate_broker_authorization(handler, verifier)
             if broker_create:
                 return j(handler, verifier.register_request(body), status=201)
+            if bot_updates:
+                verifier.notify_bot_updates(body)
+                return j(handler, {"accepted": True}, status=202)
             request_id = broker_consume.group("request_id")
             result = verifier.consume_approval(
                 request_id=request_id,
