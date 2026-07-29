@@ -47,6 +47,29 @@ includes the Agent library's once-per-process schema check.
 
 ---
 
+## Request-bound sudo approval verifier
+
+The verifier has deterministic transaction/WebAuthn/restart and service
+isolation coverage in `tests/test_sudo_approvals.py`. It uses an isolated
+temporary state directory and generated test-only P-256 keys; it never enrolls
+a real passkey or executes sudo. The suite covers every bound transaction
+field, broker identity/token, UV/origin/RP/credential rejection, duplicate
+approval/consume across restarts, pending plus approved-but-unconsumed expiry,
+strict mount modes, wrong-host rejection, the verifier-only route surface, the
+absence of approval routes/auth exemptions in the broad WebUI, and the durable
+notification claim. Notification cases exercise concurrent and sequential
+duplicates, restart persistence, ambiguous delivery failure, and replay after
+deny/consume/expiry without contacting a real webhook.
+
+For a later manual browser review, use only an isolated state directory and
+loopback origin, an isolated broker token file, mint a test enrollment link through
+`scripts/sudo_approval_admin.py`, and verify both ordinary and narrow/mobile
+layouts. Do not point this flow at a real WebUI state directory or production
+hostname. Full deployment and broker guidance is in
+[`docs/sudo-approval.md`](docs/sudo-approval.md).
+
+---
+
 ## Static JS runtime lint (brick-class regression guard)
 
 Some JS bugs throw a `TypeError`/`ReferenceError` only when a specific function

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Sudo approval</title>
+  <link rel="stylesheet" href="/static/sudo-approval.css">
+</head>
+<body>
+  <main class="approval-shell" aria-labelledby="pageTitle">
+    <div class="approval-rail" aria-hidden="true">
+      <span class="rail-mark">UV</span>
+      <span class="rail-line"></span>
+      <span class="rail-mark">01</span>
+    </div>
+
+    <section class="approval-card">
+      <header class="approval-header">
+        <div>
+          <p class="eyebrow" id="eyebrow">Request-bound verification</p>
+          <h1 id="pageTitle">Sudo approval</h1>
+        </div>
+        <span class="status-chip pending" id="statusChip">Loading</span>
+      </header>
+
+      <div id="loadingState" class="loading-state" role="status">
+        <span class="loading-pulse"></span>
+        Reading the signed request…
+      </div>
+
+      <div id="approvalView" hidden>
+        <dl class="request-ledger">
+          <div class="ledger-row command-row">
+            <dt>Exact command</dt>
+            <dd><pre id="requestCommand"></pre></dd>
+          </div>
+          <div class="ledger-row">
+            <dt>Working directory</dt>
+            <dd><code id="requestCwd"></code></dd>
+          </div>
+          <div class="ledger-row">
+            <dt>Requester</dt>
+            <dd id="requester"></dd>
+          </div>
+          <div class="ledger-row">
+            <dt>Expires</dt>
+            <dd><time id="expiry"></time><span class="countdown" id="countdown"></span></dd>
+          </div>
+          <div class="ledger-row hash-row">
+            <dt>Request ID</dt>
+            <dd><code id="requestId"></code></dd>
+          </div>
+          <div class="ledger-row hash-row">
+            <dt>Transaction SHA-256</dt>
+            <dd><code id="requestDigest"></code></dd>
+          </div>
+        </dl>
+        <p class="binding-note">
+          Your authenticator will verify this request with user verification.
+          The assertion cannot authorize changed argv, cwd, requester, broker
+          nonce, request ID, digest, or expiry.
+        </p>
+        <div class="action-row">
+          <button class="button deny" id="denyButton" type="button">Deny</button>
+          <button class="button approve" id="approveButton" type="button">
+            <span class="button-key" aria-hidden="true">◆</span>
+            Approve with passkey
+          </button>
+        </div>
+      </div>
+
+      <div id="enrollmentView" hidden>
+        <div class="enrollment-mark" aria-hidden="true">+</div>
+        <p class="enrollment-copy">
+          Enroll <strong id="enrollmentLabel">approval passkey</strong> for
+          request-bound sudo approvals. This one-time link came from the trusted
+          local administration path.
+        </p>
+        <p class="binding-note">
+          User verification is required. Enrollment creates no WebUI login
+          session and does not enable passwordless WebUI access.
+        </p>
+        <button class="button approve full" id="enrollButton" type="button">
+          Enroll approval passkey
+        </button>
+      </div>
+
+      <div id="terminalState" class="terminal-state" hidden role="status">
+        <span class="terminal-glyph" id="terminalGlyph" aria-hidden="true"></span>
+        <h2 id="terminalTitle"></h2>
+        <p id="terminalMessage"></p>
+      </div>
+
+      <p class="error-message" id="errorMessage" role="alert" hidden></p>
+      <footer>
+        <span>Single use</span>
+        <span>UV required</span>
+        <span>Short lived</span>
+      </footer>
+    </section>
+  </main>
+  <script src="/static/sudo-approval.js"></script>
+</body>
+</html>

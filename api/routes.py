@@ -11690,8 +11690,28 @@ def _render_index_shell_base() -> str:
     return base
 
 
+def _is_verifier_only_path(path: str) -> bool:
+    return (
+        path == "/v1/bot-updates"
+        or path in {
+            "/api/sudo-approval",
+            "/sudo-approval",
+            "/sudo-enrollment",
+            "/static/sudo-approval.css",
+            "/static/sudo-approval.js",
+            "/session/static/sudo-approval.css",
+            "/session/static/sudo-approval.js",
+        }
+        or path.startswith("/sudo-approval/")
+        or path.startswith("/sudo-enrollment/")
+        or path.startswith("/api/sudo-approval/")
+    )
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
+    if _is_verifier_only_path(parsed.path):
+        return False
     proxy_result = _handle_extension_sidecar_proxy(handler, parsed, "GET")
     if proxy_result is not False:
         return proxy_result
@@ -13554,6 +13574,8 @@ def _validate_session_toolsets_shape(toolsets):
 
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
+    if _is_verifier_only_path(parsed.path):
+        return False
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
     if parsed.path == "/api/csp-report":
         if diag:
@@ -13653,6 +13675,7 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.finish()
         raise
+
     if not _guard_request_session_visibility(handler, parsed, body=body, method="POST"):
         if diag:
             diag.finish()
