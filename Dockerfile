@@ -88,6 +88,12 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/b
 
 COPY --chown=root:root . /apptoo
 
+# The verifier service deliberately bypasses docker_init.bash so it never
+# receives the broad WebUI's workspace, agent source, or mutable /app setup.
+# Bake the small WebUI dependency set into the immutable image so that
+# verifier-only startup is offline, deterministic, and fail-closed.
+RUN uv pip install --system --no-cache-dir -r /apptoo/requirements.txt
+
 # Bake the git version tag into the image so the settings badge works even
 # when .git is not present (it is excluded by .dockerignore).
 # CI passes: --build-arg HERMES_VERSION=$(git describe --tags --always)
@@ -108,4 +114,3 @@ HEALTHCHECK --interval=30s --timeout=8s --start-period=10s --retries=3 \
 # before starting the WebUI server. The production image does not ship sudo.
 USER root
 CMD ["/hermeswebui_init.bash"]
-
