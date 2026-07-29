@@ -5310,21 +5310,6 @@ def apply_cors_preflight_headers(handler) -> None:
 
 def _csrf_exempt_path(path: str) -> bool:
     """Paths that cannot or must not carry a session CSRF token."""
-    if path.startswith("/api/sudo-approval/broker/v1/"):
-        # The broker API never accepts WebUI cookies. Its dedicated bearer
-        # identity and exact-host check are enforced by sudo_approval_routes.
-        return True
-    if path in {
-        "/api/sudo-approval/options",
-        "/api/sudo-approval/approve",
-        "/api/sudo-approval/deny",
-        "/api/sudo-approval/enrollment/options",
-        "/api/sudo-approval/enrollment/finish",
-    }:
-        # Sessionless by design. These endpoints apply a stricter fixed-origin
-        # check in api.sudo_approval_routes and never accept a WebUI session as
-        # authority.
-        return True
     return path in {
         "/api/auth/login",
         "/api/auth/passkey/options",
@@ -11705,17 +11690,31 @@ def _render_index_shell_base() -> str:
     return base
 
 
+def _is_verifier_only_path(path: str) -> bool:
+    return (
+        path == "/v1/bot-updates"
+        or path in {
+            "/api/sudo-approval",
+            "/sudo-approval",
+            "/sudo-enrollment",
+            "/static/sudo-approval.css",
+            "/static/sudo-approval.js",
+            "/session/static/sudo-approval.css",
+            "/session/static/sudo-approval.js",
+        }
+        or path.startswith("/sudo-approval/")
+        or path.startswith("/sudo-enrollment/")
+        or path.startswith("/api/sudo-approval/")
+    )
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
+    if _is_verifier_only_path(parsed.path):
+        return False
     proxy_result = _handle_extension_sidecar_proxy(handler, parsed, "GET")
     if proxy_result is not False:
         return proxy_result
-
-    from api.sudo_approval_routes import handle_sudo_approval_get
-
-    sudo_approval_result = handle_sudo_approval_get(handler, parsed)
-    if sudo_approval_result is not False:
-        return True
 
     if parsed.path.startswith("/session/static/"):
         # Strip the leading "/session" so _serve_static() sees a path that
@@ -13575,6 +13574,8 @@ def _validate_session_toolsets_shape(toolsets):
 
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
+    if _is_verifier_only_path(parsed.path):
+        return False
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
     if parsed.path == "/api/csp-report":
         if diag:
@@ -13674,14 +13675,6 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.finish()
         raise
-
-    from api.sudo_approval_routes import handle_sudo_approval_post
-
-    sudo_approval_result = handle_sudo_approval_post(handler, parsed, body)
-    if sudo_approval_result is not False:
-        if diag:
-            diag.finish()
-        return True
 
     if not _guard_request_session_visibility(handler, parsed, body=body, method="POST"):
         if diag:

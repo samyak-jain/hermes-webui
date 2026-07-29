@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import io
+import http.client
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -632,23 +633,6 @@ class _HeaderHandler:
         self.headers = headers
 
 
-class _ResponseHandler(_HeaderHandler):
-    def __init__(self, headers):
-        super().__init__(headers)
-        self.status = None
-        self.response_headers = {}
-        self.wfile = io.BytesIO()
-
-    def send_response(self, status):
-        self.status = status
-
-    def send_header(self, name, value):
-        self.response_headers[name] = value
-
-    def end_headers(self):
-        return None
-
-
 def test_narrow_route_requires_exact_host_and_browser_origin(verifier):
     instance, _config, _clock, _private_key = verifier
     valid = _HeaderHandler(
@@ -689,46 +673,124 @@ def test_sessionless_ui_and_broker_api_never_use_login_or_otp():
     assert "validate_broker_authorization" in routes
 
 
-def test_only_exact_sessionless_paths_bypass_webui_session(monkeypatch):
+def test_broad_webui_has_no_verifier_routes_or_auth_exemptions():
     import api.auth as auth
+    import api.routes as routes
 
-    assert auth._is_public_sudo_approval_path(
-        f"/api/sudo-approval/requests/{REQUEST_ID}/{BROKER_NONCE}"
+    verifier_paths = (
+        f"/sudo-approval/{REQUEST_ID}/{BROKER_NONCE}",
+        f"/api/sudo-approval/requests/{REQUEST_ID}/{BROKER_NONCE}",
+        "/api/sudo-approval/broker/v1/requests",
+        "/v1/bot-updates",
+        "/static/sudo-approval.js",
     )
-    assert auth._is_public_sudo_approval_path(
-        "/api/sudo-approval/broker/v1/requests"
+    assert all(routes._is_verifier_only_path(path) for path in verifier_paths)
+    assert all(not routes._csrf_exempt_path(path) for path in verifier_paths)
+    assert not hasattr(auth, "_is_public_sudo_approval_path")
+
+    route_source = Path(routes.__file__).read_text(encoding="utf-8")
+    assert "handle_sudo_approval_get" not in route_source
+    assert "handle_sudo_approval_post" not in route_source
+
+
+def test_runtime_boundary_rejects_mode_and_mount_permission_drift(tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    token_file = tmp_path / "broker.token"
+    token_file.write_text(BROKER_TOKEN, encoding="ascii")
+    token_file.chmod(0o600)
+    webhook_file = tmp_path / "bot-updates.webhook"
+    webhook_file.write_text(
+        "https://discord.com/api/webhooks/123456789/test-token",
+        encoding="ascii",
     )
-    assert not auth._is_public_sudo_approval_path(
-        "/api/sudo-approval/broker/v1/admin"
+    webhook_file.chmod(0o600)
+    verifier = ApprovalVerifier(
+        SudoApprovalConfig(
+            state_dir=state_dir,
+            rp_id=RP_ID,
+            origin=ORIGIN,
+            broker_id=BROKER_ID,
+            broker_token_file=token_file,
+            bot_updates_webhook_file=webhook_file,
+        )
     )
-    assert not auth._is_public_sudo_approval_path("/api/sudo-approval/admin")
-    monkeypatch.setattr(auth, "is_auth_enabled", lambda: True)
-    assert auth.check_auth(
-        object(),
-        urlparse(f"/sudo-approval/{REQUEST_ID}/{BROKER_NONCE}"),
+    runtime_uid = os.geteuid()
+    if runtime_uid == 0:
+        with pytest.raises(SudoApprovalConfigError, match="must not run as root"):
+            verifier.validate_runtime_boundary()
+        return
+
+    verifier.validate_runtime_boundary()
+    with pytest.raises(SudoApprovalConfigError, match="wrong owner"):
+        verifier.validate_runtime_boundary(expected_uid=runtime_uid + 1)
+    token_file.chmod(0o640)
+    with pytest.raises(SudoApprovalConfigError, match="unsafe permissions"):
+        verifier.validate_runtime_boundary()
+    token_file.chmod(0o600)
+    state_dir.chmod(0o750)
+    with pytest.raises(SudoApprovalConfigError, match="unsafe permissions"):
+        verifier.validate_runtime_boundary()
+
+
+def test_verifier_service_is_closed_to_wrong_host_and_broad_routes(
+    monkeypatch,
+    tmp_path,
+):
+    import api.sudo_approval_routes as approval_routes
+    import sudo_approval_server as service
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    token_file = tmp_path / "broker.token"
+    token_file.write_text(BROKER_TOKEN, encoding="ascii")
+    token_file.chmod(0o600)
+    webhook_file = tmp_path / "bot-updates.webhook"
+    webhook_file.write_text(
+        "https://discord.com/api/webhooks/123456789/test-token",
+        encoding="ascii",
     )
-
-
-def test_no_access_approval_hostname_cannot_expose_broad_webui(monkeypatch):
-    import api.auth as auth
-
-    monkeypatch.setenv("HERMES_WEBUI_SUDO_APPROVAL_ORIGIN", ORIGIN)
-    monkeypatch.setattr(auth, "is_auth_enabled", lambda: False)
-    blocked = _ResponseHandler({"Host": "approval.example.test"})
-    assert not auth.check_auth(blocked, urlparse("/api/sessions"))
-    assert blocked.status == 404
-    assert blocked.wfile.getvalue() == b'{"error":"Not found"}'
-
-    approval = _ResponseHandler({"Host": "approval.example.test"})
-    assert auth.check_auth(
-        approval,
-        urlparse(f"/sudo-approval/{REQUEST_ID}/{BROKER_NONCE}"),
+    webhook_file.chmod(0o600)
+    verifier = ApprovalVerifier(
+        SudoApprovalConfig(
+            state_dir=state_dir,
+            rp_id=RP_ID,
+            origin=ORIGIN,
+            broker_id=BROKER_ID,
+            broker_token_file=token_file,
+            bot_updates_webhook_file=webhook_file,
+        )
     )
-    static = _ResponseHandler({"Host": "approval.example.test"})
-    assert auth.check_auth(static, urlparse("/static/sudo-approval.js"))
+    monkeypatch.setattr(service, "configured_verifier", lambda: verifier)
+    monkeypatch.setattr(approval_routes, "configured_verifier", lambda: verifier)
+    monkeypatch.setattr(verifier, "validate_runtime_boundary", lambda: None)
 
-    ordinary_host = _ResponseHandler({"Host": "webui.example.test"})
-    assert auth.check_auth(ordinary_host, urlparse("/api/sessions"))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), service.VerifierHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        def request(path, host):
+            connection = http.client.HTTPConnection(
+                "127.0.0.1",
+                server.server_port,
+                timeout=5,
+            )
+            connection.request("GET", path, headers={"Host": host})
+            response = connection.getresponse()
+            body = response.read()
+            connection.close()
+            return response.status, body
+
+        status, body = request("/health", "127.0.0.1")
+        assert status == 200
+        assert json.loads(body)["mode"] == "verifier"
+        assert request("/api/sessions", "approval.example.test")[0] == 404
+        assert request("/static/sudo-approval.js", "webui.example.test")[0] == 404
+        assert request("/static/sudo-approval.js", "approval.example.test")[0] == 200
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
 
 
 def test_environment_config_requires_separate_state_and_broker_identity(

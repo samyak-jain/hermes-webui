@@ -109,7 +109,15 @@ from api.helpers import (
     _CLIENT_DISCONNECT_ERRORS,
 )
 from api.profiles import set_request_profile, clear_request_profile
-from api.routes import handle_delete, handle_get, handle_patch, handle_post, handle_put, apply_cors_preflight_headers
+from api.routes import (
+    _is_verifier_only_path,
+    apply_cors_preflight_headers,
+    handle_delete,
+    handle_get,
+    handle_patch,
+    handle_post,
+    handle_put,
+)
 from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
 from api.crash_visibility import install_crash_visibility
@@ -379,6 +387,8 @@ class Handler(BaseHTTPRequestHandler):
             set_request_profile(cookie_profile)
         try:
             parsed = urlparse(self.path)
+            if _is_verifier_only_path(parsed.path):
+                return j(self, {"error": "not found"}, status=404)
             if not check_auth(self, parsed): return
             result = handle_get(self, parsed)
             if result is False:
@@ -404,6 +414,8 @@ class Handler(BaseHTTPRequestHandler):
             set_request_profile(cookie_profile)
         try:
             parsed = urlparse(self.path)
+            if _is_verifier_only_path(parsed.path):
+                return j(self, {"error": "not found"}, status=404)
             _is_csp_report_post = (
                 parsed.path == "/api/csp-report" and self.command == "POST"
             )
@@ -437,6 +449,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         """Handle CORS preflight requests (headers emitted by api.routes)."""
         self._req_t0 = time.time()
+        if _is_verifier_only_path(urlparse(self.path).path):
+            return j(self, {"error": "not found"}, status=404)
         self.send_response(200)
         apply_cors_preflight_headers(self)
         # Frame the empty preflight: without Content-Length an HTTP/1.1 keep-alive

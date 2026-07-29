@@ -1,8 +1,10 @@
 # Request-bound sudo approval verifier
 
 This optional subsystem is the gateway-side verifier for the desktop
-`sudo-approval-broker`. It is separate from WebUI login passkeys, sessions,
-cookies, `settings.json`, and chat/tool approvals.
+`sudo-approval-broker`. It runs through the dedicated
+`sudo_approval_server.py` entrypoint, not `server.py`. The ordinary WebUI has
+no approval routes, public-path exemptions, state mount, broker token, or
+notification credential.
 
 ## One authoritative transaction
 
@@ -65,9 +67,12 @@ service, never privilege.
 
 ## Configuration
 
-The verifier is unavailable unless every value is explicit:
+The verifier entrypoint refuses startup unless every value is explicit, it is
+running as a non-root dedicated UID, and all three mounted paths have that UID
+as owner with exact private modes:
 
 ```sh
+HERMES_WEBUI_SERVICE_MODE=verifier
 HERMES_WEBUI_SUDO_APPROVAL_ENABLED=1
 HERMES_WEBUI_SUDO_APPROVAL_STATE_DIR=/var/lib/hermes-sudo-approval
 HERMES_WEBUI_SUDO_APPROVAL_RP_ID=approval.example.com
@@ -78,9 +83,12 @@ HERMES_WEBUI_SUDO_APPROVAL_BROKER_TOKEN_FILE=/run/secrets/sudo-approval-broker.t
 HERMES_WEBUI_SUDO_APPROVAL_BOT_UPDATES_WEBHOOK_FILE=/run/secrets/sudo-approval-bot-updates.webhook
 ```
 
-The private state directory must not be the broad WebUI state directory or a
-child of it. It uses POSIX locking, atomic fsync+rename persistence, mode 0700
-for the directory, and mode 0600 for files. Audit rows retain metadata and
+The private state directory must exist, be mode 0700, and must not be the broad
+WebUI state directory or a child of it. State and lock files are mode 0600.
+Both credential files must be regular mode-0600 files. Wrong ownership,
+symlinks, missing mounts, malformed credentials, root execution, or unsafe
+modes stop the verifier before it binds a socket. State writes use POSIX
+locking and atomic fsync+rename persistence. Audit rows retain metadata and
 digests but not command text or WebAuthn payloads.
 
 The bot-updates file contains a channel-scoped Discord HTTPS webhook URL. It is
@@ -129,14 +137,16 @@ Enrollment:
 ## Kumo deployment boundary
 
 Kumo routes `approval.<domain>` through the existing outbound Cloudflare
-Tunnel to the WebUI loopback port but creates no Access application for that
-hostname. The existing `webui.<domain>` OTP policy stays unchanged.
+Tunnel to the verifier-only loopback port but creates no Access application
+for that hostname. `webui.<domain>` routes to the separate broad WebUI
+container and keeps its OTP policy.
 
 Verifier state is mounted from a dedicated EFS directory outside
-`/mnt/efs/hermes`; the broader gateway container cannot see it. Kumo fetches
-the broker token from its own SSM parameter into tmpfs and mounts that file
-read-only into WebUI. The corresponding desktop token is installed separately
-as a systemd credential.
+`/mnt/efs/hermes`; neither the gateway nor broad WebUI container can see it.
+Kumo fetches the broker token and bot-updates webhook from dedicated SSM
+parameters into tmpfs and mounts them read-only only into the verifier
+container. The corresponding desktop token is installed separately as a
+systemd credential.
 
 UV proves the authenticator performed its configured user-verification method;
 WebAuthn does not prove that method was specifically a fingerprint. A synced

@@ -162,7 +162,7 @@ Environment variables controlling behavior:
     HERMES_CONFIG_PATH             Path to ~/.hermes/config.yaml
     HERMES_WEBUI_DEFAULT_MODEL     Optional model override; unset means provider default
     HERMES_WEBUI_PASSWORD          Optional: enable password auth (off by default)
-    HERMES_WEBUI_SUDO_APPROVAL_*   Optional fixed-origin sudo verifier (all values explicit)
+    HERMES_WEBUI_SUDO_APPROVAL_*   Verifier-only process; never broad WebUI env
     HERMES_WEBUI_SKIP_ONBOARDING   Optional: bypass the first-run onboarding wizard
     HERMES_PREFILL_MESSAGES_FILE   Optional JSON message list for browser-turn prefill context
     HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT Optional command that prints JSON messages or plain-text user prefill context

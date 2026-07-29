@@ -1,14 +1,9 @@
 """Request-bound, sessionless WebAuthn verification for sudo approvals.
 
-This subsystem intentionally does not reuse WebUI login sessions, login
-passkeys, or ``settings.json``.  Its state directory, RP ID, and origin are
-explicit deployment inputs so a later deployment can place the approval page
-on a narrow hostname without changing the broad WebUI authentication policy.
-
-Only the browser ceremony is exposed through WebUI routes.  Creating approval
-requests, consuming approvals, minting enrollment links, and revoking
-credentials are trusted local operations provided by :class:`ApprovalVerifier`
-and ``scripts/sudo_approval_admin.py``.
+This subsystem intentionally does not reuse or run inside the broad WebUI.
+Its dedicated service owns the state directory, RP ID, origin, and runtime
+credentials.  The ordinary WebUI process has neither verifier routes nor
+mounts containing approval state or secrets.
 """
 from __future__ import annotations
 
@@ -20,6 +15,7 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import tempfile
 import threading
 import time
@@ -524,6 +520,60 @@ class ApprovalVerifier:
         if serialization is None or hashes is None or ec is None:
             raise SudoApprovalConfigError("sudo approval requires the cryptography package")
 
+    @staticmethod
+    def _require_private_runtime_path(
+        path: Path,
+        *,
+        expected_mode: int,
+        expected_uid: int,
+        directory: bool,
+        label: str,
+    ) -> None:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise SudoApprovalConfigError(f"{label} is unavailable") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise SudoApprovalConfigError(f"{label} must not be a symbolic link")
+        if directory:
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise SudoApprovalConfigError(f"{label} is not a directory")
+        elif not stat.S_ISREG(metadata.st_mode):
+            raise SudoApprovalConfigError(f"{label} is not a regular file")
+        if metadata.st_uid != expected_uid:
+            raise SudoApprovalConfigError(f"{label} has the wrong owner")
+        if stat.S_IMODE(metadata.st_mode) != expected_mode:
+            raise SudoApprovalConfigError(f"{label} has unsafe permissions")
+
+    def validate_runtime_boundary(self, *, expected_uid: int | None = None) -> None:
+        """Fail startup unless all verifier-owned mounts are exact and private."""
+        runtime_uid = os.geteuid() if expected_uid is None else int(expected_uid)
+        if runtime_uid == 0:
+            raise SudoApprovalConfigError("sudo approval verifier must not run as root")
+        self._require_private_runtime_path(
+            self.config.state_dir,
+            expected_mode=0o700,
+            expected_uid=runtime_uid,
+            directory=True,
+            label="sudo approval state directory",
+        )
+        for path, label in (
+            (self.state_file, "sudo approval state file"),
+            (self.lock_file, "sudo approval state lock"),
+        ):
+            if path.exists():
+                self._require_private_runtime_path(
+                    path,
+                    expected_mode=0o600,
+                    expected_uid=runtime_uid,
+                    directory=False,
+                    label=label,
+                )
+        token = self._read_broker_token(expected_uid=runtime_uid)
+        if not token:
+            raise SudoApprovalConfigError("sudo approval broker token is malformed")
+        self._read_bot_updates_webhook(expected_uid=runtime_uid)
+
     @classmethod
     def from_env(cls) -> "ApprovalVerifier":
         return cls(config_from_env())
@@ -941,11 +991,52 @@ class ApprovalVerifier:
             ),
         }
 
-    def _read_bot_updates_webhook(self) -> str:
+    def _read_broker_token(self, *, expected_uid: int | None = None) -> str:
+        token_file = self.config.broker_token_file
+        if token_file is None:
+            raise SudoApprovalConfigError(
+                "sudo approval broker token file is not configured"
+            )
+        if expected_uid is not None:
+            self._require_private_runtime_path(
+                token_file,
+                expected_mode=0o600,
+                expected_uid=expected_uid,
+                directory=False,
+                label="sudo approval broker token",
+            )
+        try:
+            metadata = token_file.stat()
+            if metadata.st_mode & 0o077:
+                raise SudoApprovalConfigError(
+                    "sudo approval broker token permissions are too broad"
+                )
+            token = token_file.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError) as exc:
+            raise SudoApprovalConfigError(
+                "sudo approval broker token is unavailable"
+            ) from exc
+        if not (32 <= len(token) <= 512) or any(char.isspace() for char in token):
+            raise SudoApprovalConfigError("sudo approval broker token is malformed")
+        return token
+
+    def _read_bot_updates_webhook(
+        self,
+        *,
+        expected_uid: int | None = None,
+    ) -> str:
         webhook_file = self.config.bot_updates_webhook_file
         if webhook_file is None:
             raise SudoApprovalConfigError(
                 "sudo approval bot-updates webhook file is not configured"
+            )
+        if expected_uid is not None:
+            self._require_private_runtime_path(
+                webhook_file,
+                expected_mode=0o600,
+                expected_uid=expected_uid,
+                directory=False,
+                label="sudo approval bot-updates webhook",
             )
         try:
             stat = webhook_file.stat()
@@ -1102,7 +1193,10 @@ class ApprovalVerifier:
                     "bot-updates approval URL is not the registered request capability"
                 )
             self._validate_url_token(request, path_parts[3])
-        self._deliver_bot_updates(self._read_bot_updates_webhook(), payload)
+        self._deliver_bot_updates(
+            self._read_bot_updates_webhook(expected_uid=os.geteuid()),
+            payload,
+        )
 
     def _get_request(self, state: dict[str, Any], request_id: str) -> dict[str, Any]:
         request_id = _canonical_uuid(request_id, field="request_id")
@@ -1367,18 +1461,7 @@ def configured_verifier() -> ApprovalVerifier:
 
 def validate_broker_authorization(handler, verifier: ApprovalVerifier) -> None:
     """Authenticate the one dedicated desktop broker without WebUI sessions."""
-    token_file = verifier.config.broker_token_file
-    if token_file is None:
-        raise SudoApprovalConfigError("sudo approval broker token file is not configured")
-    try:
-        stat = token_file.stat()
-        if stat.st_mode & 0o077:
-            raise SudoApprovalConfigError("sudo approval broker token permissions are too broad")
-        token = token_file.read_text(encoding="ascii").strip()
-    except (OSError, UnicodeError) as exc:
-        raise SudoApprovalConfigError("sudo approval broker token is unavailable") from exc
-    if not (32 <= len(token) <= 512) or any(char.isspace() for char in token):
-        raise SudoApprovalConfigError("sudo approval broker token is malformed")
+    token = verifier._read_broker_token(expected_uid=os.geteuid())
     authorization = str(handler.headers.get("Authorization", ""))
     expected = f"Bearer {token}"
     if not hmac.compare_digest(authorization, expected):
