@@ -55,8 +55,11 @@ temporary state directory and generated test-only P-256 keys; it never enrolls
 a real passkey or executes sudo. The suite covers every bound transaction
 field, broker identity/token, UV/origin/RP/credential rejection, duplicate
 approval/consume across restarts, pending plus approved-but-unconsumed expiry,
-strict mount modes, wrong-host rejection, the verifier-only route surface, and
-the absence of approval routes/auth exemptions in the broad WebUI.
+strict mount modes, wrong-host rejection, the verifier-only route surface, the
+absence of approval routes/auth exemptions in the broad WebUI, and the durable
+notification claim. Notification cases exercise concurrent and sequential
+duplicates, restart persistence, ambiguous delivery failure, and replay after
+deny/consume/expiry without contacting a real webhook.
 
 For a later manual browser review, use only an isolated state directory and
 loopback origin, an isolated broker token file, mint a test enrollment link through

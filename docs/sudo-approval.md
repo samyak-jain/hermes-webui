@@ -97,6 +97,10 @@ to the desktop broker. The broker-authenticated `/v1/bot-updates` relay accepts
 only the literal `bot-updates` target and fields matching an already-registered
 request, then sends a notification with the exact command, requester UID and
 worker ID, Unix expiry, and deep link. It exposes no approve or deny action.
+Before network delivery, the verifier atomically persists a one-use notification
+claim in the same locked request state. Concurrent, sequential, post-restart, and
+terminal-state replays are rejected. A timeout or ambiguous webhook failure
+retains the claim and fails closed instead of risking a duplicate message.
 
 ## Credential administration
 

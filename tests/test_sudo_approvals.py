@@ -20,6 +20,7 @@ from api.sudo_approvals import (
     SudoApprovalConfig,
     SudoApprovalConfigError,
     SudoApprovalConflict,
+    SudoApprovalDeliveryError,
     SudoApprovalError,
     SudoApprovalExpired,
     SudoApprovalUnauthorized,
@@ -258,6 +259,35 @@ def _approve(instance, private_key, request_id, url_token, *, flags=0x05, **kwar
     return instance.approve(request_id, url_token, assertion), assertion
 
 
+def _notification_payload(transaction, registration):
+    return {
+        "protocol_version": 1,
+        "channel": "bot-updates",
+        "request_id": transaction["request_id"],
+        "request_digest": registration["request_digest"],
+        "command": transaction["command"],
+        "requester_uid": transaction["requester_uid"],
+        "requester_worker_id": transaction["requester_worker_id"],
+        "approval_url": registration["approval_url"],
+        "expires_at": transaction["expires_at"],
+    }
+
+
+def _notification_verifier(config, clock, webhook_file):
+    return ApprovalVerifier(
+        SudoApprovalConfig(
+            state_dir=config.state_dir,
+            rp_id=config.rp_id,
+            origin=config.origin,
+            ttl_seconds=config.ttl_seconds,
+            broker_id=config.broker_id,
+            broker_token_file=config.broker_token_file,
+            bot_updates_webhook_file=webhook_file,
+        ),
+        now=clock,
+    )
+
+
 def test_challenge_is_the_exact_canonical_transaction_digest(verifier):
     instance, _config, clock, _private_key = verifier
     transaction, registration, request_id, url_token = _register(instance, clock)
@@ -456,19 +486,7 @@ def test_bot_updates_delivery_uses_channel_scoped_exact_payload(verifier, tmp_pa
             now=clock,
             allow_insecure_bot_updates_for_tests=True,
         )
-        notifier.notify_bot_updates(
-            {
-                "protocol_version": 1,
-                "channel": "bot-updates",
-                "request_id": transaction["request_id"],
-                "request_digest": registration["request_digest"],
-                "command": transaction["command"],
-                "requester_uid": transaction["requester_uid"],
-                "requester_worker_id": transaction["requester_worker_id"],
-                "approval_url": registration["approval_url"],
-                "expires_at": transaction["expires_at"],
-            }
-        )
+        notifier.notify_bot_updates(_notification_payload(transaction, registration))
     finally:
         server.shutdown()
         thread.join(timeout=5)
@@ -492,6 +510,133 @@ def test_bot_updates_delivery_uses_channel_scoped_exact_payload(verifier, tmp_pa
     assert BROKER_TOKEN not in serialized
     assert "approve" not in serialized.lower()
     assert "deny" not in serialized.lower()
+
+
+def test_bot_updates_claim_rejects_concurrent_and_sequential_duplicates(
+    verifier,
+    tmp_path,
+    monkeypatch,
+):
+    instance, config, clock, _private_key = verifier
+    transaction, registration, _request_id, _url_token = _register(instance, clock)
+    webhook_file = tmp_path / "bot-updates.webhook"
+    webhook_file.write_text(
+        "https://discord.com/api/webhooks/123456789/test-token",
+        encoding="ascii",
+    )
+    webhook_file.chmod(0o600)
+    notifier = _notification_verifier(config, clock, webhook_file)
+    payload = _notification_payload(transaction, registration)
+    delivery_started = threading.Event()
+    release_delivery = threading.Event()
+    deliveries = []
+    failures = []
+
+    def blocked_delivery(webhook_url, delivered_payload):
+        deliveries.append((webhook_url, delivered_payload))
+        delivery_started.set()
+        assert release_delivery.wait(timeout=5)
+
+    monkeypatch.setattr(notifier, "_deliver_bot_updates", blocked_delivery)
+
+    def first_attempt():
+        try:
+            notifier.notify_bot_updates(payload)
+        except Exception as exc:  # pragma: no cover - asserted through failures.
+            failures.append(exc)
+
+    thread = threading.Thread(target=first_attempt)
+    thread.start()
+    assert delivery_started.wait(timeout=5)
+    with pytest.raises(SudoApprovalConflict, match="already claimed"):
+        notifier.notify_bot_updates(payload)
+    release_delivery.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert failures == []
+    assert len(deliveries) == 1
+    with pytest.raises(SudoApprovalConflict, match="already claimed"):
+        notifier.notify_bot_updates(payload)
+    assert len(deliveries) == 1
+
+
+def test_bot_updates_claim_survives_restart_and_delivery_failure(
+    verifier,
+    tmp_path,
+    monkeypatch,
+):
+    instance, config, clock, _private_key = verifier
+    transaction, registration, _request_id, _url_token = _register(instance, clock)
+    webhook_file = tmp_path / "bot-updates.webhook"
+    webhook_file.write_text(
+        "https://discord.com/api/webhooks/123456789/test-token",
+        encoding="ascii",
+    )
+    webhook_file.chmod(0o600)
+    notifier = _notification_verifier(config, clock, webhook_file)
+    payload = _notification_payload(transaction, registration)
+    attempts = []
+
+    def ambiguous_failure(_webhook_url, _payload):
+        attempts.append("attempted")
+        raise SudoApprovalDeliveryError("ambiguous delivery failure")
+
+    monkeypatch.setattr(notifier, "_deliver_bot_updates", ambiguous_failure)
+    with pytest.raises(SudoApprovalDeliveryError, match="ambiguous"):
+        notifier.notify_bot_updates(payload)
+
+    restarted = _notification_verifier(config, clock, webhook_file)
+    monkeypatch.setattr(restarted, "_deliver_bot_updates", ambiguous_failure)
+    with pytest.raises(SudoApprovalConflict, match="already claimed"):
+        restarted.notify_bot_updates(payload)
+    assert attempts == ["attempted"]
+
+
+@pytest.mark.parametrize("terminal_state", ["denied", "consumed", "expired"])
+def test_bot_updates_rejects_terminal_request_replay(
+    verifier,
+    tmp_path,
+    monkeypatch,
+    terminal_state,
+):
+    instance, config, clock, private_key = verifier
+    transaction, registration, request_id, url_token = _register(instance, clock)
+    if terminal_state == "denied":
+        instance.deny(request_id, url_token)
+    elif terminal_state == "consumed":
+        approved, _assertion = _approve(
+            instance,
+            private_key,
+            request_id,
+            url_token,
+        )
+        instance.consume_approval(
+            request_id=request_id,
+            request=transaction,
+            request_digest=registration["request_digest"],
+            decision_id=approved["decision_id"],
+        )
+    else:
+        clock.advance(90)
+
+    webhook_file = tmp_path / "bot-updates.webhook"
+    webhook_file.write_text(
+        "https://discord.com/api/webhooks/123456789/test-token",
+        encoding="ascii",
+    )
+    webhook_file.chmod(0o600)
+    restarted = _notification_verifier(config, clock, webhook_file)
+    deliveries = []
+    monkeypatch.setattr(
+        restarted,
+        "_deliver_bot_updates",
+        lambda *_args: deliveries.append("delivered"),
+    )
+
+    with pytest.raises(SudoApprovalConflict, match="terminal request"):
+        restarted.notify_bot_updates(_notification_payload(transaction, registration))
+    assert deliveries == []
 
 
 def test_pending_and_approved_unconsumed_requests_expire_after_restart(verifier):

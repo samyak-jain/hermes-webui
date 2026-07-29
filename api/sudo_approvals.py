@@ -1166,6 +1166,14 @@ class ApprovalVerifier:
         request_id = _canonical_uuid(payload["request_id"], field="request_id")
         with self._locked_state() as state:
             request = self._get_request(state, request_id)
+            if request.get("state") != "pending":
+                raise SudoApprovalConflict(
+                    "bot-updates notification is not available for a terminal request"
+                )
+            if isinstance(request.get("bot_updates_notification_claim"), dict):
+                raise SudoApprovalConflict(
+                    "bot-updates notification was already claimed"
+                )
             transaction = request["transaction"]
             expected_values = {
                 "request_digest": request["request_digest"],
@@ -1193,6 +1201,13 @@ class ApprovalVerifier:
                     "bot-updates approval URL is not the registered request capability"
                 )
             self._validate_url_token(request, path_parts[3])
+            request["bot_updates_notification_claim"] = {
+                "claimed_at": int(self._now()),
+                "payload_sha256": hashlib.sha256(
+                    _canonical_json(payload)
+                ).hexdigest(),
+            }
+            self._audit(state, "bot_updates_notification_claimed", request=request)
         self._deliver_bot_updates(
             self._read_bot_updates_webhook(expected_uid=os.geteuid()),
             payload,
