@@ -57,6 +57,8 @@ actions. The topbar remains focused on conversation context and the workspace/fi
     api/
       __init__.py          Package marker
       auth.py              Optional password authentication, signed cookies, passkeys/WebAuthn
+      sudo_approvals.py    Isolated request-bound UV WebAuthn state machine for sudo
+      sudo_approval_routes.py Sessionless browser adapters; no create/consume admin API
       config.py            Discovery, globals, model detection, reloadable config
       helpers.py           HTTP helpers: j(), bad(), require(), safe_resolve(), security headers
       models.py            Session model + CRUD, per-session profile tracking, CLI/state.db bridge
@@ -160,6 +162,7 @@ Environment variables controlling behavior:
     HERMES_CONFIG_PATH             Path to ~/.hermes/config.yaml
     HERMES_WEBUI_DEFAULT_MODEL     Optional model override; unset means provider default
     HERMES_WEBUI_PASSWORD          Optional: enable password auth (off by default)
+    HERMES_WEBUI_SUDO_APPROVAL_*   Optional fixed-origin sudo verifier (all values explicit)
     HERMES_WEBUI_SKIP_ONBOARDING   Optional: bypass the first-run onboarding wizard
     HERMES_PREFILL_MESSAGES_FILE   Optional JSON message list for browser-turn prefill context
     HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT Optional command that prints JSON messages or plain-text user prefill context

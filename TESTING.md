@@ -47,6 +47,22 @@ includes the Agent library's once-per-process schema check.
 
 ---
 
+## Request-bound sudo approval verifier
+
+The verifier has deterministic unit/route/source coverage in
+`tests/test_sudo_approvals.py`. It uses an isolated temporary state directory
+and generated test-only P-256 keys; it never enrolls a real passkey or executes
+sudo.
+
+For a later manual browser review, use only an isolated state directory and
+loopback origin, mint a test enrollment link through
+`scripts/sudo_approval_admin.py`, and verify both ordinary and narrow/mobile
+layouts. Do not point this flow at a real WebUI state directory or production
+hostname. Full deployment and broker guidance is in
+[`docs/sudo-approval.md`](docs/sudo-approval.md).
+
+---
+
 ## Static JS runtime lint (brick-class regression guard)
 
 Some JS bugs throw a `TypeError`/`ReferenceError` only when a specific function

@@ -5310,6 +5310,17 @@ def apply_cors_preflight_headers(handler) -> None:
 
 def _csrf_exempt_path(path: str) -> bool:
     """Paths that cannot or must not carry a session CSRF token."""
+    if path in {
+        "/api/sudo-approval/options",
+        "/api/sudo-approval/approve",
+        "/api/sudo-approval/deny",
+        "/api/sudo-approval/enrollment/options",
+        "/api/sudo-approval/enrollment/finish",
+    }:
+        # Sessionless by design. These endpoints apply a stricter fixed-origin
+        # check in api.sudo_approval_routes and never accept a WebUI session as
+        # authority.
+        return True
     return path in {
         "/api/auth/login",
         "/api/auth/passkey/options",
@@ -11696,6 +11707,12 @@ def handle_get(handler, parsed) -> bool:
     if proxy_result is not False:
         return proxy_result
 
+    from api.sudo_approval_routes import handle_sudo_approval_get
+
+    sudo_approval_result = handle_sudo_approval_get(handler, parsed)
+    if sudo_approval_result is not False:
+        return True
+
     if parsed.path.startswith("/session/static/"):
         # Strip the leading "/session" so _serve_static() sees a path that
         # starts with "/static/" (its required prefix). _serve_static enforces
@@ -13653,6 +13670,15 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.finish()
         raise
+
+    from api.sudo_approval_routes import handle_sudo_approval_post
+
+    sudo_approval_result = handle_sudo_approval_post(handler, parsed, body)
+    if sudo_approval_result is not False:
+        if diag:
+            diag.finish()
+        return True
+
     if not _guard_request_session_visibility(handler, parsed, body=body, method="POST"):
         if diag:
             diag.finish()

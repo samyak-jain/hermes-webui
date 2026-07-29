@@ -58,6 +58,24 @@ PUBLIC_PATHS = frozenset({
     '/session/manifest.json', '/session/manifest.webmanifest',
 })
 
+_PUBLIC_SUDO_APPROVAL_API_PATHS = frozenset({
+    '/api/sudo-approval/options',
+    '/api/sudo-approval/approve',
+    '/api/sudo-approval/deny',
+    '/api/sudo-approval/enrollment/options',
+    '/api/sudo-approval/enrollment/finish',
+})
+
+
+def _is_public_sudo_approval_path(path: str) -> bool:
+    return (
+        path.startswith('/sudo-approval/')
+        or path.startswith('/sudo-enrollment/')
+        or path.startswith('/api/sudo-approval/requests/')
+        or path.startswith('/api/sudo-approval/enrollments/')
+        or path in _PUBLIC_SUDO_APPROVAL_API_PATHS
+    )
+
 COOKIE_NAME = 'hermes_session'
 CSRF_HEADER_NAME = 'X-Hermes-CSRF-Token'
 
@@ -735,6 +753,7 @@ def check_auth(handler, parsed) -> bool:
     if (
         parsed.path in PUBLIC_PATHS
         or parsed.path.startswith('/share/')
+        or _is_public_sudo_approval_path(parsed.path)
         or (
             parsed.path.startswith('/api/share/')
             and parsed.path not in {'/api/share/create', '/api/share/revoke'}
